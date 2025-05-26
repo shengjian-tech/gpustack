@@ -7,7 +7,7 @@ from argon2 import PasswordHasher
 
 ph = PasswordHasher()
 
-API_KEY_PREFIX = "gpustack"
+API_KEY_PREFIX = "shengjian"
 JWT_TOKEN_EXPIRE_MINUTES = 120
 
 
