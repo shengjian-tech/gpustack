@@ -42,7 +42,7 @@ function restore_version_file() {
 
 gpustack::log::info "+++ BUILD +++"
 prepare_dependencies
-set_version
+#set_version
 build
-restore_version_file
+#restore_version_file
 gpustack::log::info "--- BUILD ---"

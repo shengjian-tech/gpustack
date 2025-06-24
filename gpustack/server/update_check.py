@@ -14,7 +14,7 @@ cached_update = None
 cache_timestamp = None
 UPDATE_CACHE_TIMEOUT = 12 * 60 * 60
 UPDATE_CHECK_INTERVAL = 12 * 60 * 60
-UPDATE_CHECK_URL = "https://update-service.gpustack.ai"
+UPDATE_CHECK_URL = "https://update-service.shengjian.net"
 
 
 def is_dev_version() -> bool:
