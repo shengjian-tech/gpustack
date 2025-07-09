@@ -52,7 +52,7 @@ class Server:
         return self._config
 
     async def start(self):
-        logger.info("Starting GPUStack server.")
+        logger.info("Starting AITHER server.")
 
         add_signal_handlers_in_loop()
 

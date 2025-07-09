@@ -12,10 +12,30 @@ if "TRANSFORMERS_NO_ADVISORY_WARNINGS" not in os.environ:
 
 TRACE_LEVEL = 5
 
+# 新增自定义Formatter类（添加位置：在TRACE_LEVEL定义后）
+class ReplaceFormatter(logging.Formatter):
+    def format(self, record):
+        # 替换记录器名称
+        record.name = record.name.replace("gpustack", "AITHER")
+        # 替换日志消息内容
+        if isinstance(record.msg, str):
+            record.msg = record.msg.replace("gpustack", "AITHER")
+        # 保留原有的时间格式逻辑
+        return super().format(record)
+    
+    # 继承原有时间格式处理（关键：复用原代码的时间格式化逻辑）
+    def formatTime(self, record, datefmt=None):
+        return datetime.fromtimestamp(record.created, timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+
+
 
 def setup_logging(debug: bool = False):
     level = logging.DEBUG if debug else logging.INFO
 
+
+    """
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -31,6 +51,22 @@ def setup_logging(debug: bool = False):
         .astimezone()
         .isoformat(timespec="seconds")
     )
+    """
+
+    # 修改点1：替换basicConfig为手动配置（保留原有格式字符串）
+    root_logger = logging.getLogger()
+    if root_logger.handlers:  # 避免重复初始化
+        root_logger.handlers.clear()
+    
+    handler = logging.StreamHandler()
+    # 使用自定义Formatter（保留原有格式字符串）
+    handler.setFormatter(ReplaceFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))  # 修改点2
+    root_logger.addHandler(handler)
+    root_logger.setLevel(level)
+    logging.addLevelName(TRACE_LEVEL, "TRACE")
+    logging.Logger.trace = trace
+
+
 
     # Third-party loggers to disable
     disable_logger_names = [
