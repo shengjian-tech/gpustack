@@ -10,7 +10,6 @@ from sqlmodel import Field, Relationship, SQLModel, Text
 from gpustack.schemas.common import PaginatedList, UTCDateTime, pydantic_column_type
 from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.links import ModelInstanceModelFileLink
-from gpustack.schemas.workers import RPCServer
 from gpustack.utils.command import find_parameter
 
 if TYPE_CHECKING:
@@ -176,9 +175,11 @@ class ModelSpecBase(SQLModel, ModelSource):
 
     backend: Optional[str] = None
     backend_version: Optional[str] = None
-    backend_parameters: Optional[List[str]] = Field(sa_column=Column(JSON), default=[])
+    backend_parameters: Optional[List[str]] = Field(
+        sa_column=Column(JSON), default=None
+    )
 
-    env: Optional[Dict[str, str]] = Field(sa_column=Column(JSON), default={})
+    env: Optional[Dict[str, str]] = Field(sa_column=Column(JSON), default=None)
     restart_on_error: Optional[bool] = True
     distributable: Optional[bool] = False
 
@@ -215,10 +216,6 @@ class ModelBase(ModelSpecBase):
         elif backend == BackendEnum.ASCEND_MINDIE:
             if self.cpu_offloading:
                 raise ValueError("CPU offloading is only supported for GGUF models")
-            if self.distributed_inference_across_workers:
-                raise ValueError(
-                    "Distributed inference across workers is not supported for the ascend-mindie backend"
-                )
         return self
 
 
@@ -275,31 +272,56 @@ class ComputedResourceClaim(BaseModel):
     tensor_split: Optional[List[int]] = Field(default=None)
 
 
-class ModelInstanceRPCServer(RPCServer):
+class ModelInstanceSubordinateWorker(BaseModel):
     worker_id: Optional[int] = None
-    computed_resource_claim: Optional[ComputedResourceClaim] = Field(
-        sa_column=Column(pydantic_column_type(ComputedResourceClaim)), default=None
-    )
-
-
-class RayActor(BaseModel):
-    worker_id: Optional[int] = None
+    worker_name: Optional[str] = None
     worker_ip: Optional[str] = None
     total_gpus: Optional[int] = None
-    gpu_indexes: Optional[List[int]] = None
+    gpu_indexes: Optional[List[int]] = Field(sa_column=Column(JSON), default=[])
+    gpu_addresses: Optional[List[str]] = Field(sa_column=Column(JSON), default=[])
     computed_resource_claim: Optional[ComputedResourceClaim] = Field(
         sa_column=Column(pydantic_column_type(ComputedResourceClaim)), default=None
     )
+    # - For model file preparation
     download_progress: Optional[float] = None
+    # - For model instance serving preparation
+    pid: Optional[int] = None
+    ports: Optional[List[int]] = Field(sa_column=Column(JSON), default=[])
+    arguments: Optional[List[str]] = Field(sa_column=Column(JSON), default=[])
+    state: ModelInstanceStateEnum = ModelInstanceStateEnum.PENDING
+    state_message: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
+
+class DistributedServerCoordinateModeEnum(Enum):
+    # DELEGATED means that the subordinate workers' coordinate is by-pass to other framework.
+    # For example, vLLM instance passes its distribution deployment to the underlay RAY service.
+    DELEGATED = "delegated"
+    # INITIALIZE_LATER means that the subordinate workers' coordinate is handled by GPUStack,
+    # the subordinate workers should start after the main worker initializes.
+    # For example, Ascend MindIE instance needs to start its subordinate workers after the main worker initializes.
+    INITIALIZE_LATER = "initialize_later"
+    # RUN_FIRST means that the subordinate workers' coordinate is handled by GPUStack,
+    # the subordinate workers must get ready before the main worker starts.
+    # TODO: The situation of llama-box model instance and its subordinate workers(RPC servers) is more like this,
+    #       the RPC servers must get ready before the main server starts.
+    #       But, currently, we have started the RPC servers at beginning of the model instance start,
+    #       so llama-box model instances treat as DELEGATED.
+    #       We can refactor this in the future for supporting https://github.com/gpustack/gpustack/issues/1788.
+    RUN_FIRST = "run_first"
 
 
 class DistributedServers(BaseModel):
-    rpc_servers: Optional[List[ModelInstanceRPCServer]] = Field(
+    # Indicates how the distributed servers coordinate with the main worker.
+    mode: DistributedServerCoordinateModeEnum = (
+        DistributedServerCoordinateModeEnum.DELEGATED
+    )
+    # Indicates if subordinate workers should download model files.
+    download_model_files: Optional[bool] = True
+    subordinate_workers: Optional[List[ModelInstanceSubordinateWorker]] = Field(
         sa_column=Column(JSON), default=[]
     )
-
-    ray_actors: Optional[List[RayActor]] = Field(sa_column=Column(JSON), default=[])
-
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -309,7 +331,9 @@ class ModelInstanceBase(SQLModel, ModelSource):
     worker_name: Optional[str] = None
     worker_ip: Optional[str] = None
     pid: Optional[int] = None
+    # FIXME: Migrate to ports.
     port: Optional[int] = None
+    ports: Optional[List[int]] = Field(sa_column=Column(JSON), default=[])
     download_progress: Optional[float] = None
     resolved_path: Optional[str] = None
     restart_count: Optional[int] = 0
@@ -324,6 +348,7 @@ class ModelInstanceBase(SQLModel, ModelSource):
         sa_column=Column(pydantic_column_type(ComputedResourceClaim)), default=None
     )
     gpu_indexes: Optional[List[int]] = Field(sa_column=Column(JSON), default=[])
+    gpu_addresses: Optional[List[str]] = Field(sa_column=Column(JSON), default=[])
 
     model_id: int = Field(default=None, foreign_key="models.id")
     model_name: str

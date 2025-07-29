@@ -1,5 +1,7 @@
+import json
 import logging
-from typing import List, Optional
+import os
+from typing import Dict, List, Optional
 from pathlib import Path
 import fnmatch
 from threading import Lock
@@ -13,10 +15,12 @@ from huggingface_hub.utils import GatedRepoError, HfHubHTTPError
 from requests.exceptions import HTTPError
 
 from gpustack.config.config import get_global_config
-from gpustack.schemas.models import Model, SourceEnum
+from gpustack.schemas.models import Model, SourceEnum, get_mmproj_filename
+from gpustack.utils.cache import is_cached, load_cache, save_cache
 
 logger = logging.getLogger(__name__)
 
+LIST_REPO_CACHE_DIR = "repo-skeleton"
 
 MODELSCOPE_CONFIG_ALLOW_FILE_PATTERN = [
     '*.json',
@@ -28,6 +32,94 @@ MODELSCOPE_CONFIG_ALLOW_FILE_PATTERN = [
 def get_model_lock(model_id: str) -> Lock:
     """Get or create a lock for the given model_id. The model_id is used as the key to store Lock in cache."""
     return Lock()
+
+
+class FileEntry:
+    def __init__(self, rfilename: str, size: Optional[int] = None):
+        self.rfilename = rfilename
+        self.size = size
+
+
+def get_model_path_and_name(model: Model) -> (str, str):
+    if model.source == SourceEnum.HUGGING_FACE:
+        return model.huggingface_repo_id, model.huggingface_filename
+    elif model.source == SourceEnum.MODEL_SCOPE:
+        return model.model_scope_model_id, model.model_scope_file_path
+    elif model.source == SourceEnum.OLLAMA_LIBRARY:
+        return model.ollama_library_model_name, ""
+    elif model.source == SourceEnum.LOCAL_PATH:
+        return model.local_path, ""
+    else:
+        return "", ""
+
+
+def match_file_and_calculate_size(
+    files: List[FileEntry],
+    model: Model,
+    cache_dir: str,
+) -> (int, List[str]):
+    """
+    Match the files and calculate the total size.
+    Also return the selected files.
+    """
+
+    selected_files = []
+    match_files = []
+    extra_files = []
+
+    file_path, filename = get_model_path_and_name(model)
+    extra_filename = get_mmproj_filename(model)
+
+    if file_path and not filename:
+        return (
+            sum(f.size for f in files if getattr(f, 'size', None) is not None),
+            [f"{cache_dir}/{model.source.value}/{file_path}"],
+        )
+
+    for sibling in files:
+        if sibling.size is None:
+            continue
+
+        rfilename = sibling.rfilename
+
+        if filename and fnmatch.fnmatch(rfilename, filename):
+            selected_files.append(rfilename)
+            match_files.append(sibling)
+        elif extra_filename and fnmatch.fnmatch(rfilename, extra_filename):
+            extra_files.append(rfilename)
+            match_files.append(sibling)
+
+    best_extra = select_most_suitable_extra_file(extra_files)
+    if best_extra:
+        selected_files.append(best_extra)
+
+    sum_size = sum(
+        f.size
+        for f in match_files
+        if getattr(f, 'rfilename', '') in selected_files
+        and getattr(f, 'size', None) is not None
+    )
+
+    if selected_files and model.source in [
+        SourceEnum.HUGGING_FACE,
+        SourceEnum.MODEL_SCOPE,
+    ]:
+        selected_files = [
+            f"{cache_dir}/{model.source.value}/{file_path}/{f}" for f in selected_files
+        ]
+
+    return sum_size, selected_files
+
+
+def select_most_suitable_extra_file(file_list: List[str]) -> str:
+    """
+    Select the most suitable extra file from the list of files.
+    For example, when matches f16 and f32 mmproj files, prefer f32 over f16
+    """
+    if not file_list or len(file_list) == 0:
+        return ""
+    _file_list = sorted(file_list, reverse=True)
+    return _file_list[0]
 
 
 def match_hugging_face_files(
@@ -59,13 +151,73 @@ def match_hugging_face_files(
     extra_matching_files = [
         file for file in file_list if fnmatch.fnmatch(file, extra_filename)
     ]
-    extra_matching_files = sorted(extra_matching_files, reverse=True)
-    if extra_matching_files:
-        # Add the first element of the extra matching files to the matching files
-        # For example, when matches f16 and f32 mmproj files, prefer f32 over f16
-        matching_files.append(extra_matching_files[0])
+    extra_file = select_most_suitable_extra_file(extra_matching_files)
+    if extra_file:
+        matching_files.append(extra_file)
 
     return matching_files
+
+
+def is_repo_cached(repo_id: str, source: str) -> bool:
+    if not repo_id or not source:
+        return False
+    cache_key = f"{source}:{repo_id}"
+    return is_cached(LIST_REPO_CACHE_DIR, cache_key)
+
+
+def list_repo(
+    repo_id: str,
+    source: str,
+    token: Optional[str] = None,
+    cache_expiration: Optional[int] = None,
+) -> List[Dict[str, any]]:
+    cache_key = f"{source}:{repo_id}"
+    cached_result, is_succ = load_cache(
+        LIST_REPO_CACHE_DIR, cache_key, cache_expiration
+    )
+    if is_succ:
+        result = json.loads(cached_result)
+        if isinstance(result, list):
+            return result
+
+    if source == SourceEnum.HUGGING_FACE:
+        validate_repo_id(repo_id)
+        hffs = HfFileSystem(token=token)
+        file_info = []
+        for file in hffs.ls(repo_id, recursive=True):
+            if not isinstance(file, dict):
+                continue
+            file_info.append(
+                {
+                    "name": Path(file["name"]).relative_to(repo_id).as_posix(),
+                    "size": file["size"],
+                }
+            )
+    elif source == SourceEnum.MODEL_SCOPE:
+        msapi = HubApi()
+        files = msapi.get_model_files(repo_id, recursive=True)
+        file_info = []
+        for file in files:
+            file_info.append(
+                {
+                    "name": file["Path"],
+                    "size": file["Size"],
+                }
+            )
+    else:
+        raise ValueError(f"Invalid source: {source}")
+
+    if not save_cache(LIST_REPO_CACHE_DIR, cache_key, json.dumps(file_info)):
+        logger.info(f"Saved cache {LIST_REPO_CACHE_DIR} {cache_key} fail")
+
+    return file_info
+
+
+def filter_filename(file_path: str, file_paths: List[str]):
+    matching_paths = [p for p in file_paths if fnmatch.fnmatch(p, file_path)]
+    matching_paths = sorted(matching_paths)
+
+    return matching_paths
 
 
 def match_model_scope_file_paths(
@@ -110,24 +262,17 @@ def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
     """
     weight_file_extensions = (".safetensors", ".bin", ".pt", ".pth")
     if model.source == SourceEnum.HUGGING_FACE:
-        api = HfApi(token=token)
-        repo_info = api.repo_info(model.huggingface_repo_id, files_metadata=True)
-        total_size = sum(
-            sibling.size
-            for sibling in repo_info.siblings
-            if sibling.size is not None
-            and sibling.rfilename.endswith(weight_file_extensions)
-        )
-        return total_size
+        repo_id = model.huggingface_repo_id
     elif model.source == SourceEnum.MODEL_SCOPE:
-        api = HubApi()
-        files = api.get_model_files(model.model_scope_model_id, recursive=True)
-
-        return sum(
-            file["Size"]
-            for file in files
-            if file["Name"].endswith(weight_file_extensions)
-        )
+        repo_id = model.model_scope_model_id
+    else:
+        raise ValueError(f"Unknown source {model.source}")
+    repo_file_infos = list_repo(repo_id, model.source, token=token)
+    return sum(
+        file.get("size", 0)
+        for file in repo_file_infos
+        if file.get("name", "").endswith(weight_file_extensions)
+    )
 
 
 def get_pretrained_config(model: Model, **kwargs):
@@ -152,38 +297,44 @@ def get_pretrained_config(model: Model, **kwargs):
             model.huggingface_repo_id,
             token=global_config.huggingface_token,
             trust_remote_code=trust_remote_code,
+            cache_dir=os.path.join(global_config.cache_dir, "huggingface"),
         )
     elif model.source == SourceEnum.MODEL_SCOPE:
-        from modelscope import AutoConfig, snapshot_download
+        from modelscope import AutoConfig
 
-        try:
-
-            with get_model_lock(model.model_scope_model_id):
-                # Download first then load config locally.
-                # A temporary workaround for the issue:
-                # https://github.com/modelscope/modelscope/issues/1302
-                config_dir = snapshot_download(
-                    model.model_scope_model_id,
-                    allow_file_pattern=MODELSCOPE_CONFIG_ALLOW_FILE_PATTERN,
-                )
-
-                pretrained_config = AutoConfig.from_pretrained(
-                    config_dir,
-                    trust_remote_code=trust_remote_code,
-                )
-        except ValueError as e:
-            if config_dir in str(e):
-                # Make the message not confusing.
-                raise ValueError(str(e).replace(config_dir, model.model_scope_model_id))
-            else:
-                raise e
+        model_scope_cache_dir = os.path.join(global_config.cache_dir, "model_scope")
+        repo_cache_dir = os.path.join(
+            model_scope_cache_dir, *model.model_scope_model_id.split('/')
+        )
+        local_files_only = False
+        pretrained_model_name_or_path = model.model_scope_model_id
+        if os.path.exists(repo_cache_dir):
+            local_files_only = True
+            pretrained_model_name_or_path = repo_cache_dir
+        with get_model_lock(model.model_scope_model_id):
+            pretrained_config = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                allow_file_pattern=MODELSCOPE_CONFIG_ALLOW_FILE_PATTERN,
+                cache_dir=model_scope_cache_dir,
+                local_files_only=local_files_only,
+            )
     elif model.source == SourceEnum.LOCAL_PATH:
+        if not os.path.exists(model.local_path):
+            logger.warning(
+                f"Local Path: {model.readable_source} is not local to the server node and may reside on a worker node."
+            )
+            # Return an empty dict here to facilitate special handling by upstream methods.
+            return {}
+
         from transformers import AutoConfig
 
         pretrained_config = AutoConfig.from_pretrained(
             model.local_path,
             trust_remote_code=trust_remote_code,
+            local_files_only=True,
         )
+
     else:
         raise ValueError(f"Unsupported model source: {model.source}")
 

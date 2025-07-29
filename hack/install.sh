@@ -12,9 +12,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "${ROOT_DIR}/hack/lib/init.sh"
 
 function download_deps() {
-  pip install poetry==1.8.3 pre-commit==3.7.1
+  pip install poetry==1.8.3
   poetry install
-  pre-commit install
+  if [[ "${POETRY_ONLY:-false}" == "false" ]]; then
+    pip install pre-commit==3.7.1
+    pre-commit install
+  fi
 }
 
 function download_ui() {
@@ -22,12 +25,15 @@ function download_ui() {
   local ui_path="${ROOT_DIR}/gpustack/ui"
   local tmp_ui_path="${ui_path}/tmp"
   local tag="latest"
-  # local tag="${1}"
+
+  if [[ "${GIT_VERSION}" != "v0.0.0" ]]; then
+    tag="${GIT_VERSION}"
+  fi
 
   rm -rf "${ui_path}"
   mkdir -p "${tmp_ui_path}/ui"
 
-  gpustack::log::info "downloading ui assets"
+  gpustack::log::info "downloading '${tag}' UI assets"
 
   if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${tag}.tar.gz" 2>/dev/null |
     tar -xzf - --directory "${tmp_ui_path}/ui" 2>/dev/null; then

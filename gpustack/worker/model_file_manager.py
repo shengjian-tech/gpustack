@@ -4,16 +4,24 @@ from functools import partial
 import glob
 from itertools import chain
 import logging
+from pathlib import Path
 import time
 from typing import Dict, Tuple
+from modelscope.hub.constants import TEMPORARY_FOLDER_NAME
 from multiprocessing import Manager, cpu_count
+from huggingface_hub._local_folder import get_local_download_paths
+from huggingface_hub.file_download import get_hf_file_metadata, hf_hub_url
+import huggingface_hub.constants
+from huggingface_hub.utils import build_hf_headers
 
-
+from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
 from gpustack.logging import setup_logging
 from gpustack.schemas.model_files import ModelFile, ModelFileUpdate, ModelFileStateEnum
 from gpustack.client import ClientSet
+from gpustack.schemas.models import SourceEnum
 from gpustack.server.bus import Event, EventType
+from gpustack.utils import hub
 from gpustack.utils.file import delete_path
 from gpustack.worker import downloaders
 
@@ -88,9 +96,13 @@ class ModelFileManager:
             cancel_flag.set()
             future.cancel()
             try:
-                await future
-            except asyncio.CancelledError:
+                await asyncio.wrap_future(future)
+            except (asyncio.CancelledError, NotFoundException):
                 pass
+            except Exception as e:
+                logger.error(
+                    f"Error while cancelling download for {model_file.readable_source}(id: {model_file.id}): {e}"
+                )
             finally:
                 logger.info(
                     f"Cancelled download for deleted model: {model_file.readable_source}(id: {model_file.id})"
@@ -98,6 +110,99 @@ class ModelFileManager:
 
         if model_file.cleanup_on_delete:
             await self._delete_model_file(model_file)
+
+    async def get_hf_file_metadata(self, model_file: ModelFile, filename: str):
+        token = self._config.huggingface_token
+        url = hf_hub_url(model_file.huggingface_repo_id, filename)
+        headers = build_hf_headers(token=token)
+
+        metadata = await asyncio.to_thread(
+            get_hf_file_metadata,
+            url=url,
+            timeout=huggingface_hub.constants.DEFAULT_ETAG_TIMEOUT,
+            headers=headers,
+            token=token,
+        )
+        return metadata
+
+    async def _get_incomplete_model_files(  # noqa: C901
+        self, model_file: ModelFile
+    ) -> set:
+        """
+        Finds cached files of models being downloaded.
+        1.For models from Hugging Face, their .incomplete filenames are encoded. The process requires:
+        [filename_pattern → model_name → etag → incomplete_pattern → .incomplete_filename] to ultimately confirm the file.
+        2.For models from ModelScope, the incomplete files are stored in a temporary folder.
+        we just need to find them by the filename pattern.
+        """
+        paths_to_delete = set()
+
+        try:
+            if model_file.source == SourceEnum.HUGGING_FACE:
+                if not model_file.huggingface_filename:
+                    # The resolved_paths in vLLM model points to entire dir of cache, delete it directly
+                    paths_to_delete.update(model_file.resolved_paths)
+                    return paths_to_delete
+
+                for path in model_file.resolved_paths:
+                    path_obj = Path(str(path))
+                    filename_pattern = path_obj.name
+                    local_dir = path_obj.parent
+                    download_paths = get_local_download_paths(
+                        local_dir, filename_pattern
+                    )
+                    cache_dir = download_paths.lock_path.parent
+                    filename = ""
+
+                    # Get actual filename by pattern
+                    for cache_file in await asyncio.to_thread(
+                        glob.glob, str(cache_dir / filename_pattern) + "*"
+                    ):
+                        # cut off the path and useless extension
+                        filename = cache_file.rsplit("/", 1)[-1]
+                        filename = filename.rsplit(".", 1)[0]
+                        break
+
+                    metadata = await self.get_hf_file_metadata(model_file, filename)
+
+                    # Collect lock files and incomplete files
+                    paths_to_delete.add(str(cache_dir / (filename + ".lock")))
+                    paths_to_delete.add(str(cache_dir / (filename + ".metadata")))
+                    for item_path_str in await asyncio.to_thread(
+                        glob.glob, str(cache_dir / f"*.{metadata.etag}.incomplete")
+                    ):
+                        paths_to_delete.add(item_path_str)
+
+            elif model_file.source == SourceEnum.MODEL_SCOPE:
+                if not model_file.model_scope_file_path:
+                    # The resolved_paths in vLLM model points to entire dir of cache, delete it directly
+                    paths_to_delete.update(model_file.resolved_paths)
+                    return paths_to_delete
+
+                for path in model_file.resolved_paths:
+                    path_obj = Path(str(path))
+                    filename_pattern = path_obj.name
+                    local_dir = path_obj.parent
+                    for delete_file in await asyncio.to_thread(
+                        glob.glob,
+                        str(local_dir / f"{TEMPORARY_FOLDER_NAME}/{filename_pattern}"),
+                    ):
+                        paths_to_delete.add(delete_file)
+
+        except Exception as e:
+            logger.error(
+                f"Error deleting incomplete Download files for "
+                f"file '{filename}': {e}"
+            )
+
+        return paths_to_delete
+
+    async def _delete_incomplete_model_files(self, model_file: ModelFile):
+        paths_to_delete = await self._get_incomplete_model_files(model_file)
+
+        for delete_file in paths_to_delete:
+            logger.info(f"Attempting to delete incomplete file: {delete_file}")
+            await asyncio.to_thread(delete_path, delete_file)
 
     async def _delete_model_file(self, model_file: ModelFile):
         try:
@@ -108,8 +213,9 @@ class ModelFileManager:
                 for path in paths:
                     delete_path(path)
 
+            await self._delete_incomplete_model_files(model_file)
             logger.info(
-                f"Deleted model file {model_file.readable_source}(id: {model_file.id})"
+                f"Deleted model file {model_file.readable_source}(id: {model_file.id}) from disk"
             )
         except Exception as e:
             logger.error(
@@ -136,6 +242,10 @@ class ModelFileManager:
         async def _check_completion():
             try:
                 await asyncio.wrap_future(future)
+            except NotFoundException:
+                logger.info(
+                    f"Model file {model_file.readable_source} not found. Maybe it was cancelled."
+                )
             except Exception as e:
                 logger.error(f"Failed to download model file: {e}")
                 await self._update_model_file(
@@ -166,7 +276,7 @@ class ModelFileDownloadTask:
             password=self._config.token,
         )
 
-        self._ensure_model_file_size()
+        self._ensure_model_file_size_and_paths()
 
         self._last_download_update_time = 0
         self._model_downloaded_size = 0
@@ -269,18 +379,27 @@ class ModelFileDownloadTask:
         tqdm._original_init = _original_init
         tqdm._original_update = _original_update
 
-    def _ensure_model_file_size(self):
+    def _ensure_model_file_size_and_paths(self):
         if self._model_file.size is not None:
             return
 
-        size = downloaders.get_model_file_size(
+        repo_file_list = downloaders.get_model_file_info(
             self._model_file,
             huggingface_token=self._config.huggingface_token,
             cache_dir=self._config.cache_dir,
             ollama_library_base_url=self._config.ollama_library_base_url,
         )
+
+        (size, file_paths) = hub.match_file_and_calculate_size(
+            files=repo_file_list,
+            model=self._model_file,
+            cache_dir=self._config.cache_dir,
+        )
+
         self._model_file.size = size
-        self._update_model_file(self._model_file.id, size=size)
+        self._update_model_file(
+            self._model_file.id, size=size, resolved_paths=file_paths
+        )
 
     def _update_model_file_progress(self, model_file_id: int, progress: float):
         self._update_model_file(model_file_id, download_progress=progress)

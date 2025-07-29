@@ -4,7 +4,7 @@ RAGFlow can integrate with GPUStack to leverage locally deployed LLMs, embedding
 
 ## Deploying Models
 
-1. In GPUStack UI, navigate to the `Models` page and click on `Deploy Model` to deploy the models you need. Here are some example models:
+1. In GPUStack UI, navigate to the `Deployments` page and click on `Deploy Model` to deploy the models you need. Here are some example models:
 
 - qwen3-8b
 - qwen2.5-vl-3b-instruct
@@ -19,7 +19,7 @@ RAGFlow can integrate with GPUStack to leverage locally deployed LLMs, embedding
 
 ## Create an API Key
 
-1. Navigate to the `API Keys` page and click on `New API Key`.
+1. Hover over the user avatar and navigate to the `API Keys` page, then click on `New API Key`.
 
 2. Fill in the name, then click `Save`.
 

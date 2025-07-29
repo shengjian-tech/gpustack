@@ -4,13 +4,15 @@ import json
 import logging
 import multiprocessing
 import os
-from typing import Any, Dict, Optional
+import sys
+from typing import Any, Dict
 
 import yaml
 
 from gpustack import __version__, __git_commit__
 from gpustack.config.config import set_global_config
 from gpustack.logging import setup_logging
+from gpustack.utils.envs import get_gpustack_env, get_gpustack_env_bool
 from gpustack.worker.worker import Worker
 from gpustack.config import Config
 from gpustack.server.server import Server
@@ -112,6 +114,24 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         help="Port of Ray object manager. Used when Ray is enabled. The default is 40099.",
         default=get_gpustack_env("RAY_OBJECT_MANAGER_PORT"),
     )
+    group.add_argument(
+        "--ray-dashboard-agent-grpc-port",
+        type=int,
+        help="Port for Ray dashboard agent gPRC listen. Used when Ray is enabled. The default is 40101.",
+        default=get_gpustack_env("RAY_DASHBOARD_AGENT_GRPC_PORT"),
+    )
+    group.add_argument(
+        "--ray-dashboard-agent-listen-port",
+        type=int,
+        help="Port for Ray dashboard agent HTTP listen. Used when Ray is enabled. The default is 52365.",
+        default=get_gpustack_env("RAY_DASHBOARD_AGENT_LISTEN_PORT"),
+    )
+    group.add_argument(
+        "--ray-metrics-export-port",
+        type=int,
+        help="Port for Ray metrics export. Used when Ray is enabled. The default is 40103.",
+        default=get_gpustack_env("RAY_METRICS_EXPORT_PORT"),
+    )
 
     group = parser_server.add_argument_group("Server settings")
     group.add_argument(
@@ -166,7 +186,7 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
     group.add_argument(
         "--ollama-library-base-url",
         type=str,
-        help="Base URL of the Ollama library. The default is https://registry.ollama.ai.",
+        help=argparse.SUPPRESS,
         default=get_gpustack_env("OLLAMA_LIBRARY_BASE_URL"),
     )
     group.add_argument(
@@ -204,6 +224,12 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         type=int,
         help="Port of Ray Client Server. Used when Ray is enabled. The default is 40097.",
         default=get_gpustack_env("RAY_CLIENT_SERVER_PORT"),
+    )
+    group.add_argument(
+        "--ray-dashboard-port",
+        type=int,
+        help="Port of Ray dashboard. Used when Ray is enabled. The default is 8265.",
+        default=get_gpustack_env("RAY_DASHBOARD_PORT"),
     )
 
     group = parser_server.add_argument_group("Worker settings")
@@ -247,7 +273,7 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
     group.add_argument(
         "--ray-worker-port-range",
         type=str,
-        help="Port range for Ray worker processes, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. The default is '40100-40131'.",
+        help="Port range for Ray worker processes, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. The default is '40200-40999'.",
         default=get_gpustack_env("RAY_WORKER_PORT_RANGE"),
     )
     group.add_argument(
@@ -306,31 +332,36 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         default=os.getenv("HF_HUB_ENABLE_HF_TRANSFER"),
     )
     group.add_argument(
-        "--enable-cors",
+        "--enable-hf-xet",
         action=OptionalBoolAction,
-        help="Enable CORS in server.",
-        default=get_gpustack_env_bool("ENABLE_CORS"),
+        help="Enable using Hugging Face Xet to download model files.",
     )
     group.add_argument(
-        "--allow-origins",
-        action='append',
-        help="A list of origins that should be permitted to make cross-origin requests.",
+        "--enable-cors",
+        action=OptionalBoolAction,
+        help="Enable Cross-Origin Resource Sharing (CORS) on the server.",
+        default=get_gpustack_env_bool("ENABLE_CORS"),
     )
     group.add_argument(
         "--allow-credentials",
         action=OptionalBoolAction,
-        help="Indicate that cookies should be supported for cross-origin requests.",
+        help="Allow cookies and credentials in cross-origin requests.",
         default=get_gpustack_env_bool("ALLOW_CREDENTIALS"),
+    )
+    group.add_argument(
+        "--allow-origins",
+        action='append',
+        help='Origins allowed for cross-origin requests. Specify the flag multiple times for multiple origins. Example: --allow-origins https://example.com --allow-origins https://api.example.com. Default: ["*"] (all origins allowed).',
     )
     group.add_argument(
         "--allow-methods",
         action='append',
-        help="A list of HTTP methods that should be allowed for cross-origin requests.",
+        help='HTTP methods allowed in cross-origin requests. Specify the flag multiple times for multiple methods. Example: --allow-methods GET --allow-methods POST. Default: ["GET", "POST"].',
     )
     group.add_argument(
         "--allow-headers",
         action='append',
-        help="A list of HTTP request headers that should be supported for cross-origin requests.",
+        help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers Content-Type. Default: ["Authorization", "Content-Type"].',
     )
 
     parser_server.set_defaults(func=run)
@@ -342,6 +373,7 @@ def run(args: argparse.Namespace):
         setup_logging(cfg.debug)
         debug_env_info()
         set_third_party_env(cfg=cfg)
+        set_ulimit()
         multiprocessing.set_start_method('spawn')
 
         logger.info(f"GPUStack version: {__version__} ({__git_commit__})")
@@ -478,25 +510,14 @@ def set_worker_options(args, config_data: dict):
         "rpc_server_args",
         "system_reserved",
         "tools_download_base_url",
+        "ray_metrics_export_port",
         "ray_worker_port_range",
         "enable_hf_transfer",
+        "enable_hf_xet",
     ]
 
     for option in options:
         set_config_option(args, config_data, option)
-
-
-def get_gpustack_env(env_var: str) -> Optional[str]:
-    env_name = "GPUSTACK_" + env_var
-    return os.getenv(env_name)
-
-
-def get_gpustack_env_bool(env_var: str) -> Optional[bool]:
-    env_name = "GPUSTACK_" + env_var
-    env_value = os.getenv(env_name)
-    if env_value is not None:
-        return env_value.lower() in ["true", "1"]
-    return None
 
 
 def debug_env_info():
@@ -510,3 +531,31 @@ def set_third_party_env(cfg: Config):
         # https://huggingface.co/docs/huggingface_hub/guides/download#faster-downloads
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         logger.debug("set env HF_HUB_ENABLE_HF_TRANSFER=1")
+
+    if not cfg.enable_hf_xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        logger.debug("set env HF_HUB_DISABLE_XET=1")
+
+
+# Adapted from: https://github.com/vllm-project/vllm/blob/main/vllm/utils.py#L2438
+def set_ulimit(target_soft_limit=65535):
+    if sys.platform.startswith('win'):
+        logger.info("Windows detected, skipping ulimit adjustment.")
+        return
+    import resource
+
+    resource_type = resource.RLIMIT_NOFILE
+    current_soft, current_hard = resource.getrlimit(resource_type)
+
+    if current_soft < target_soft_limit:
+        try:
+            resource.setrlimit(resource_type, (target_soft_limit, current_hard))
+            logger.info(
+                f"Increase the ulimit from {current_soft} to {target_soft_limit}."
+            )
+        except ValueError as e:
+            logger.warning(
+                f"Failed to set ulimit (nofile): {e}. "
+                f"Current soft limit: {current_soft}. "
+                "Consider increasing with `ulimit -n`."
+            )

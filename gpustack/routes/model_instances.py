@@ -11,7 +11,7 @@ from gpustack.api.exceptions import (
     NotFoundException,
 )
 from gpustack.schemas.workers import Worker
-from gpustack.server.deps import ListParamsDep, SessionDep
+from gpustack.server.deps import EngineDep, ListParamsDep, SessionDep
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceCreate,
@@ -25,6 +25,7 @@ router = APIRouter()
 
 @router.get("", response_model=ModelInstancesPublic)
 async def get_model_instances(
+    engine: EngineDep,
     session: SessionDep,
     params: ListParamsDep,
     id: Optional[int] = None,
@@ -47,7 +48,7 @@ async def get_model_instances(
 
     if params.watch:
         return StreamingResponse(
-            ModelInstance.streaming(session, fields=fields),
+            ModelInstance.streaming(engine, fields=fields),
             media_type="text/event-stream",
         )
 
@@ -105,10 +106,10 @@ async def get_serving_logs(
             try:
                 async with client.get(model_instance_log_url, timeout=timeout) as resp:
                     if resp.status != 200:
-                        raise HTTPException(
-                            status_code=resp.status,
-                            detail=f"Error fetching serving logs: {resp.reason}",
-                        )
+                        body = await resp.read()
+                        yield body, resp.headers, resp.status
+                        return
+
                     async for chunk in resp.content.iter_any():
                         yield chunk, resp.headers, resp.status
             except Exception as e:

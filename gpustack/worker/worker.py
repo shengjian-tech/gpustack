@@ -1,9 +1,12 @@
 import asyncio
+from contextlib import asynccontextmanager
 import os
 import logging
 import socket
+import uuid
 from typing import Optional
 
+import aiohttp
 from fastapi import FastAPI
 import setproctitle
 import tenacity
@@ -11,6 +14,7 @@ import uvicorn
 
 from gpustack.api import exceptions
 from gpustack.config import Config
+from gpustack.config.envs import TCP_CONNECTOR_LIMIT
 from gpustack.routes import debug, probes
 from gpustack.routes.worker import logs, proxy
 from gpustack.schemas.workers import SystemReserved, WorkerUpdate
@@ -21,13 +25,13 @@ from gpustack.utils.network import get_first_non_loopback_ip
 from gpustack.client import ClientSet
 from gpustack.logging import setup_logging
 from gpustack.utils.process import add_signal_handlers_in_loop
+from gpustack.utils.system_check import check_glibc_version
 from gpustack.utils.task import run_periodically_in_thread
 from gpustack.worker.model_file_manager import ModelFileManager
 from gpustack.worker.serve_manager import ServeManager
 from gpustack.worker.exporter import MetricExporter
 from gpustack.worker.tools_manager import ToolsManager
 from gpustack.worker.worker_manager import WorkerManager
-
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +72,8 @@ class Worker:
             self._config.worker_ip = self._worker_ip
             self._enable_worker_ip_monitor = True
 
+        self._worker_uuid = self._get_worker_uuid()
+
         self._worker_name = cfg.worker_name
         if self._worker_name is None:
             self._worker_name = self._get_worker_name()
@@ -83,6 +89,7 @@ class Worker:
             system_reserved=self._system_reserved,
             clientset=self._clientset,
             cfg=cfg,
+            worker_uuid=self._worker_uuid,
         )
         self._exporter = MetricExporter(
             worker_ip=self._worker_ip,
@@ -107,6 +114,18 @@ class Worker:
                 file.write(worker_name)
 
         return worker_name
+
+    def _get_worker_uuid(self):
+        worker_uuid_path = os.path.join(self._config.data_dir, "worker_uuid")
+        if os.path.exists(worker_uuid_path):
+            with open(worker_uuid_path, "r") as file:
+                worker_uuid = file.read().strip()
+        else:
+            worker_uuid = str(uuid.uuid4())
+            with open(worker_uuid_path, "w") as file:
+                file.write(worker_uuid)
+
+        return worker_uuid
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(5),
@@ -139,10 +158,14 @@ class Worker:
         if self._is_embedded:
             setproctitle.setproctitle("gpustack_worker")
 
+        check_glibc_version()
+
         tools_manager = ToolsManager(
             tools_download_base_url=self._config.tools_download_base_url,
             pipx_path=self._config.pipx_path,
             device=self.get_device_by_gpu_devices(),
+            data_dir=self._config.data_dir,
+            bin_dir=self._config.bin_dir,
         )
         tools_manager.prepare_tools()
         catalog.prepare_chat_templates(self._config.data_dir)
@@ -220,7 +243,21 @@ class Worker:
         Start the worker server to expose APIs.
         """
 
-        app = FastAPI(title="GPUStack Worker", response_model_exclude_unset=True)
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            connector = aiohttp.TCPConnector(
+                limit=TCP_CONNECTOR_LIMIT,
+                force_close=True,
+            )
+            app.state.http_client = aiohttp.ClientSession(connector=connector)
+            yield
+            await app.state.http_client.close()
+
+        app = FastAPI(
+            title="GPUStack Worker",
+            response_model_exclude_unset=True,
+            lifespan=lifespan,
+        )
         app.state.config = self._config
 
         app.include_router(debug.router, prefix="/debug")

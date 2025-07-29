@@ -50,6 +50,7 @@ extra_css:
   - stylesheets/extra.css
   - https://unpkg.com/katex@0/dist/katex.min.css
 markdown_extensions:
+  - attr_list
   - md_in_html
   - pymdownx.highlight
   - pymdownx.superfences
@@ -89,12 +90,19 @@ nav:
       - Moore Threads MUSA:
           - Online Installation: installation/moorethreads-musa/online-installation.md
           - Air-Gapped Installation: installation/moorethreads-musa/air-gapped-installation.md
+      - Iluvatar Corex:
+          - Online Installation: installation/iluvatar-corex/online-installation.md
+          - Air-Gapped Installation: installation/iluvatar-corex/air-gapped-installation.md
+      - Cambricon MLU:
+          - Online Installation: installation/cambricon-mlu/online-installation.md
       - CPU:
           - Online Installation: installation/cpu/online-installation.md
           - Air-Gapped Installation: installation/cpu/air-gapped-installation.md
+      - Desktop Installer: installation/desktop-installer.md
       - Installation Script: installation/installation-script.md
       - Uninstallation: installation/uninstallation.md
   - Upgrade: upgrade.md
+  - Migration: migration.md
   - User Guide:
       - Playground:
           - Playgound: user-guide/playground/index.md
@@ -103,7 +111,7 @@ nav:
           - Audio: user-guide/playground/audio.md
           - Embedding: user-guide/playground/embedding.md
           - Rerank: user-guide/playground/rerank.md
-      - Model Management: user-guide/model-management.md
+      - Model Deployment Management: user-guide/model-deployment-management.md
       - Model Catalog: user-guide/model-catalog.md
       - Model File management: user-guide/model-file-management.md
       - API Key Management: user-guide/api-key-management.md
@@ -114,6 +122,7 @@ nav:
       - OpenAI Compatible APIs: user-guide/openai-compatible-apis.md
       - Image Generation APIs: user-guide/image-generation-apis.md
       - Rerank API: user-guide/rerank-api.md
+      - Desktop Setup: user-guide/desktop-setup.md
   - Using Models:
       - Using Large Language Models: using-models/using-large-language-models.md
       - Using Vision Language Models: using-models/using-vision-language-models.md
@@ -125,14 +134,15 @@ nav:
       - Using Audio Models: using-models/using-audio-models.md
   - Tutorials:
       - Running DeepSeek R1 671B with Distributed vLLM: tutorials/running-deepseek-r1-671b-with-distributed-vllm.md
+      - Running DeepSeek R1 671B with Distributed Ascend Mindie: tutorials/running-deepseek-r1-671b-with-distributed-ascend-mindie.md
       - Performing Distributed Inference Across Workers (llama-box): tutorials/performing-distributed-inference-across-workers-llama-box.md
       - Inference On CPUs: tutorials/inference-on-cpus.md
       - Inference with Tool Calling: tutorials/inference-with-tool-calling.md
       - Running on Copilot+ PCs with Snapdragon X: tutorials/running-on-copilot-plus-pcs-with-snapdragon-x.md
   - Integrations:
       - OpenAI Compatible APIs: integrations/openai-compatible-apis.md
-      - Integrate with Dify: integrations/interate-with-dify.md
-      - Integrate with RAGFlow: integrations/interate-with-ragflow.md
+      - Integrate with Dify: integrations/integrate-with-dify.md
+      - Integrate with RAGFlow: integrations/integrate-with-ragflow.md
   - Architecture: architecture.md
   - Scheduler: scheduler.md
   - Troubleshooting: troubleshooting.md

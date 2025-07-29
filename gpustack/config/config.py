@@ -17,6 +17,7 @@ from gpustack.schemas.workers import (
     UptimeInfo,
     VendorEnum,
     GPUDevicesInfo,
+    GPUNetworkInfo,
 )
 from gpustack.utils import platform
 from gpustack.utils.platform import DeviceTypeEnum, device_type_from_vendor
@@ -64,13 +65,14 @@ class Config(BaseSettings):
         rpc_server_port_range: Port range for RPC servers, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. Default is '40064-40095'.
         ray_node_manager_port: Raylet port for node manager. Used when Ray is enabled. Default is 40098.
         ray_object_manager_port: Raylet port for object manager. Used when Ray is enabled. Default is 40099.
-        ray_worker_port_range: Port range for Ray worker processes, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. Default is '40100-40131'.
+        ray_worker_port_range: Port range for Ray worker processes, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. Default is '40200-40999'.
         log_dir: Directory to store logs.
         bin_dir: Directory to store additional binaries, e.g., versioned backend executables.
         pipx_path: Path to the pipx executable, used to install versioned backends.
         system_reserved: Reserved system resources.
         tools_download_base_url: Base URL to download dependency tools.
         enable_hf_transfer: Speed up file transfers with the huggingface Hub.
+        enable_hf_xet: Using Hugging Face XET for download model files.
         enable_cors: Enable CORS in server.
         allow_origins: A list of origins that should be permitted to make cross-origin requests.
         allow_credentials: Indicate that cookies should be supported for cross-origin requests.
@@ -88,6 +90,9 @@ class Config(BaseSettings):
     ray_args: Optional[List[str]] = None
     ray_node_manager_port: int = 40098
     ray_object_manager_port: int = 40099
+    ray_dashboard_agent_grpc_port: int = 40101
+    ray_dashboard_agent_listen_port: int = 52365
+    ray_metrics_export_port: int = 40103
 
     # Server options
     host: Optional[str] = "0.0.0.0"
@@ -107,6 +112,7 @@ class Config(BaseSettings):
     model_catalog_file: Optional[str] = None
     ray_port: int = 40096
     ray_client_server_port: int = 40097
+    ray_dashboard_port: int = 8265
     enable_cors: bool = False
     allow_origins: Optional[List[str]] = ['*']
     allow_credentials: bool = False
@@ -123,7 +129,7 @@ class Config(BaseSettings):
     metrics_port: int = 10151
     service_port_range: Optional[str] = "40000-40063"
     rpc_server_port_range: Optional[str] = "40064-40095"
-    ray_worker_port_range: Optional[str] = "40100-40131"
+    ray_worker_port_range: Optional[str] = "40200-40999"
     log_dir: Optional[str] = None
     resources: Optional[dict] = None
     bin_dir: Optional[str] = None
@@ -131,6 +137,7 @@ class Config(BaseSettings):
     tools_download_base_url: Optional[str] = None
     rpc_server_args: Optional[List[str]] = None
     enable_hf_transfer: bool = False
+    enable_hf_xet: bool = False
 
     def __init__(self, **values):
         super().__init__(**values)
@@ -138,15 +145,23 @@ class Config(BaseSettings):
         # common options
         if self.data_dir is None:
             self.data_dir = self.get_data_dir()
+        else:
+            self.data_dir = os.path.abspath(self.data_dir)
 
         if self.cache_dir is None:
             self.cache_dir = os.path.join(self.data_dir, "cache")
+        else:
+            self.cache_dir = os.path.abspath(self.cache_dir)
 
         if self.bin_dir is None:
             self.bin_dir = os.path.join(self.data_dir, "bin")
+        else:
+            self.bin_dir = os.path.abspath(self.bin_dir)
 
         if self.log_dir is None:
             self.log_dir = os.path.join(self.data_dir, "log")
+        else:
+            self.log_dir = os.path.abspath(self.log_dir)
 
         if not self._is_server() and not self.token:
             raise Exception("Token is required when running as a worker")
@@ -346,7 +361,7 @@ class Config(BaseSettings):
 
         return system_info
 
-    def get_gpu_devices(self) -> GPUDevicesInfo:
+    def get_gpu_devices(self) -> GPUDevicesInfo:  # noqa: C901
         """get gpu devices from resources
         resource example:
         ```yaml
@@ -355,9 +370,31 @@ class Config(BaseSettings):
             - name: Apple M1 Pro
               vendor: Apple
               index: 0
+              device_index: 0              # optional
+              device_chip_index: 0         # optional
               memory:
                   total: 22906503168
                   is_unified_memory: true
+        ```
+        ```yaml
+        resources:
+            gpu_devices:
+            - name: Ascend CANN 910b
+              vendor: Huawei
+              index: 0
+              device_index: 0              # optional
+              device_chip_index: 0         # optional
+              memory:
+                  total: 22906503168
+                  is_unified_memory: true
+              network:
+                  status: "up"
+                  inet: "29.17.45.215"
+                  netmask: "255.255.0.0"   # optional
+                  mac: "6c34:91:87:3c:ae"  # optional
+                  gateway: "29.17.0.1"     # optional
+                  iface: "eth4"            # optional
+                  mtu: 8192                # optional
         ```
         """
         gpu_devices: GPUDevicesInfo = []
@@ -371,8 +408,11 @@ class Config(BaseSettings):
         for gd in gpu_device_dict:
             name = gd.get("name")
             index = gd.get("index")
+            device_index = gd.get("device_index", index)
+            device_chip_index = gd.get("device_chip_index", 0)
             vendor = gd.get("vendor")
             memory = gd.get("memory")
+            network = gd.get("network")
             type = gd.get("type") or device_type_from_vendor(vendor)
 
             if not name:
@@ -383,29 +423,60 @@ class Config(BaseSettings):
 
             if vendor not in VendorEnum.__members__.values():
                 raise Exception(
-                    "Unsupported GPU device vendor, supported vendors are: Apple, NVIDIA, 'Moore Threads', Huawei, AMD, Hygon"
+                    "Unsupported GPU device vendor, supported vendors are: Apple, NVIDIA, 'Moore Threads', Huawei, AMD, Hygon, Iluvatar, Cambricon"
                 )
 
             if not memory:
                 raise Exception("GPU device memory is required")
+            elif not memory.get("total"):
+                raise Exception("GPU device memory total is required")
+
+            if network:
+                network_status = network.get("status", "up")
+                if network_status not in ["up", "down"]:
+                    raise Exception(
+                        "GPU device network status is invalid, supported status are: up, down"
+                    )
+                network_inet = network.get("inet", None)
+                if network_inet is None:
+                    raise Exception("GPU device network inet is required")
+                elif not validators.ip(network_inet):
+                    raise Exception("GPU device network inet is invalid")
+                network_netmask = network.get("netmask", None)
+                if network_netmask and not validators.ip(network_netmask):
+                    raise Exception("GPU device network netmask is invalid")
+                gateway = network.get("gateway", None)
+                if gateway and not validators.ip(gateway):
+                    raise Exception("GPU device network gateway is invalid")
 
             if type not in DeviceTypeEnum.__members__.values():
                 raise Exception(
-                    "Unsupported GPU type, supported type are: cuda, musa, npu, mps, rocm, dcu"
+                    "Unsupported GPU type, supported type are: cuda, musa, npu, mps, rocm, dcu, corex, mlu"
                 )
-
-            memory_total = memory.get("total")
-            memory_is_unified_memory = memory.get("is_unified_memory", False)
-            if memory_total is None:
-                raise Exception("GPU device memory total is required")
 
             gpu_devices.append(
                 GPUDeviceInfo(
-                    name=name,
                     index=index,
+                    device_index=device_index,
+                    device_chip_index=device_chip_index,
+                    name=name,
                     vendor=vendor,
                     memory=MemoryInfo(
-                        total=memory_total, is_unified_memory=memory_is_unified_memory
+                        total=memory.get("total"),
+                        is_unified_memory=memory.get("is_unified_memory", False),
+                    ),
+                    network=(
+                        None
+                        if not network
+                        else GPUNetworkInfo(
+                            status=network.get("status", "up"),
+                            inet=network.get("inet"),
+                            netmask=network.get("netmask", ""),
+                            mac=network.get("mac", ""),
+                            gateway=network.get("gateway", ""),
+                            iface=network.get("iface", None),
+                            mtu=network.get("mtu", None),
+                        )
                     ),
                     type=type,
                 )

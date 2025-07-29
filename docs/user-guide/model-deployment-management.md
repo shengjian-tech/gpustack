@@ -1,10 +1,10 @@
-# Model Management
+# Model Deployment Management
 
-You can manage large language models in GPUStack by navigating to the `Models` page. A model in GPUStack contains one or multiple replicas of model instances. On deployment, GPUStack automatically computes resource requirements for the model instances from model metadata and schedules them to available workers accordingly.
+You can manage model deployments in GPUStack by navigating to the `Models - Deployments` page. A model deployment in GPUStack contains one or multiple replicas of model instances. On deployment, GPUStack automatically computes resource requirements for the model instances from model metadata and schedules them to available workers accordingly.
 
 ## Deploy Model
 
-Currently, models from [Hugging Face](https://huggingface.co), [ModelScope](https://modelscope.cn), [Ollama](https://ollama.com/library) and local paths are supported.
+Currently, models from [Hugging Face](https://huggingface.co), [ModelScope](https://modelscope.cn), and local paths are supported.
 
 ### Deploying a Hugging Face Model
 
@@ -34,24 +34,6 @@ Currently, models from [Hugging Face](https://huggingface.co), [ModelScope](http
 
 6. Click the `Save` button.
 
-### Deploying an Ollama Model
-
-!!! warning
-
-    As of version v0.6.1, Ollama model source is deprecated. For more context, please refer to the [GitHub issue](https://github.com/gpustack/gpustack/issues/1979).
-
-1. Click the `Deploy Model` button, then select `Ollama Library` in the dropdown.
-
-2. Fill in the `Name` of the model.
-
-3. Select an `Ollama Model` from the dropdown list, or input any Ollama model you need. For example, `llama3`, `llama3:70b` or `youraccount/llama3:70b`.
-
-4. Adjust the `Replicas` as needed.
-
-5. Expand the `Advanced` section for advanced configurations if needed. Please refer to the [Advanced Model Configuration](#advanced-model-configuration) section for more details.
-
-6. Click the `Save` button.
-
 ### Deploying a Local Path Model
 
 You can deploy a model from a local path. The model path can be a directory (e.g., a downloaded Hugging Face model directory) or a file (e.g., a GGUF model file) located on workers. This is useful when running in an air-gapped environment.
@@ -65,7 +47,7 @@ To deploy a local path model:
 
 1. Click the `Deploy Model` button, then select `Local Path` in the dropdown.
 
-2. Fill in the `Name` of the model.
+2. Fill in the `Name` of the deployment.
 
 3. Fill in the `Model Path`.
 
@@ -75,86 +57,61 @@ To deploy a local path model:
 
 6. Click the `Save` button.
 
-## Edit Model
+## Edit Model Deployment
 
-1. Find the model you want to edit on the model list page.
+1. Find the model deployment you want to edit on the deployment list page.
 2. Click the `Edit` button in the `Operations` column.
 3. Update the attributes as needed. For example, change the `Replicas` to scale up or down.
 4. Click the `Save` button.
 
 !!! note
 
-    After editing the model, the configuration will not be applied to existing model instances. You need to delete the existing model instances. GPUStack will recreate new instances based on the updated model configuration.
+    After editing the model deployment, the configuration will not be applied to existing model instances. You need to delete the existing model instances. GPUStack will recreate new instances based on the updated model configuration.
 
-## Stop Model
+## Stop Model Deployment
 
-Stopping a model will delete all model instances and release the resources. It is equivalent to scaling down the model to zero replicas.
+Stopping a model deployment will delete all model instances and release the resources. It is equivalent to scaling down the model to zero replicas.
 
-1. Find the model you want to stop on the model list page.
+1. Find the model deployment you want to stop on the deployment list page.
 2. Click the ellipsis button in the `Operations` column, then select `Stop`.
 3. Confirm the operation.
 
-## Start Model
+## Start Model Deployment
 
-Starting a model is equivalent to scaling up the model to one replica.
+Starting a model deployment is equivalent to scaling up the model to one replica.
 
-1. Find the model you want to start on the model list page.
+1. Find the model deployment you want to start on the deployment list page.
 2. Click the ellipsis button in the `Operations` column, then select `Start`.
 
-## Delete Model
+## Delete Model Deployment
 
-1. Find the model you want to delete on the model list page.
+1. Find the model deployment you want to delete on the deployment list page.
 2. Click the ellipsis button in the `Operations` column, then select `Delete`.
 3. Confirm the deletion.
 
 ## View Model Instance
 
-1. Find the model you want to check on the model list page.
-2. Click the `>` symbol to view the instance list of the model.
+1. Find the model deployment you want to check on the deployment list page.
+2. Click the `>` symbol to view the instance list of the deployment.
 
 ## Delete Model Instance
 
-1. Find the model you want to check on the model list page.
-2. Click the `>` symbol to view the instance list of the model.
+1. Find the model deployment you want to check on the deployment list page.
+2. Click the `>` symbol to view the instance list of the deployment.
 3. Find the model instance you want to delete.
 4. Click the ellipsis button for the model instance in the `Operations` column, then select `Delete`.
 5. Confirm the deletion.
 
 !!! note
 
-    After a model instance is deleted, GPUStack will recreate a new instance to satisfy the expected replicas of the model if necessary.
+    After a model instance is deleted, GPUStack will recreate a new instance to satisfy the expected replicas of the deployment if necessary.
 
 ## View Model Instance Logs
 
-1. Find the model you want to check on the model list page.
-2. Click the `>` symbol to view the instance list of the model.
+1. Find the model deployment you want to check on the deployment list page.
+2. Click the `>` symbol to view the instance list of the deployment.
 3. Find the model instance you want to check.
 4. Click the `View Logs` button for the model instance in the `Operations` column.
-
-## Use Self-hosted Ollama Models
-
-!!! warning
-
-    As of version v0.6.1, Ollama model source is deprecated. For more context, please refer to the [GitHub issue](https://github.com/gpustack/gpustack/issues/1979).
-
-You can deploy self-hosted Ollama models by configuring the `--ollama-library-base-url` option in the GPUStack server. The `Ollama Library` URL should point to the base URL of the Ollama model registry. For example, `https://registry.mycompany.com`.
-
-Here is an example workflow to set up a registry, publish a model, and use it in GPUStack:
-
-```bash
-# Run a self-hosted OCI registry
-docker run -d -p 5001:5000 --name registry registry:2
-
-# Push a model to the registry using Ollama
-ollama pull llama3
-ollama cp llama3 localhost:5001/library/llama3
-ollama push localhost:5001/library/llama3 --insecure
-
-# Start GPUStack server with the custom Ollama library URL
-curl -sfL https://get.gpustack.ai | sh -s - --ollama-library-base-url http://localhost:5001
-```
-
-That's it! You can now deploy the model `llama3` from `Ollama Library` source in GPUStack as usual, but the model will now be fetched from the self-hosted registry.
 
 ## Advanced Model Configuration
 
@@ -180,9 +137,9 @@ GPUStack automatically schedules model instances to appropriate GPUs/Workers bas
 
   When configured, the scheduler will deploy the model instance to the worker containing specified labels.
 
-  1. Navigate to the `Resources` page and edit the desired worker. Assign custom labels to the worker by adding them in the labels section.
+  1. Navigate to the `Workers` page and edit the desired worker. Assign custom labels to the worker by adding them in the labels section.
 
-  2. Go to the `Models` page and click on the `Deploy Model` button. Expand the `Advanced` section and input the previously assigned worker labels in the `Worker Selector` configuration. During deployment, the Model Instance will be allocated to the corresponding worker based on these labels.
+  2. Go to the `Deployments` page and click on the `Deploy Model` button. Expand the `Advanced` section and input the previously assigned worker labels in the `Worker Selector` configuration. During deployment, the Model Instance will be allocated to the corresponding worker based on these labels.
 
 #### Manual
 

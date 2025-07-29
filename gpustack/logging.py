@@ -47,9 +47,7 @@ def setup_logging(debug: bool = False):
     logging.Formatter.formatTime = (
         lambda self, record, datefmt=None: datetime.fromtimestamp(
             record.created, timezone.utc
-        )
-        .astimezone()
-        .isoformat(timespec="seconds")
+        ).astimezone()
     )
     """
 
@@ -86,6 +84,7 @@ def setup_logging(debug: bool = False):
         "python_multipart.multipart",
         "filelock",
         "fastapi-cdn-host",
+        "huggingface_hub.file_download",
     ]
 
     for logger_name in disable_logger_names:

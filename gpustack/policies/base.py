@@ -5,8 +5,7 @@ from typing import Dict, List, Optional, Tuple
 from gpustack.schemas.models import (
     ComputedResourceClaim,
     ModelInstance,
-    ModelInstanceRPCServer,
-    RayActor,
+    ModelInstanceSubordinateWorker,
 )
 from gpustack.schemas.workers import Worker
 
@@ -24,46 +23,47 @@ class ModelInstanceScheduleCandidate:
     worker: Worker
     gpu_indexes: Optional[List[int]]
     computed_resource_claim: ComputedResourceClaim
+    gpu_addresses: Optional[List[str]] = None
     score: Optional[float] = None
     overcommit: Optional[bool] = None
 
     # for multi-worker distributed scheduling
-    rpc_servers: Optional[List[ModelInstanceRPCServer]] = None
-    ray_actors: Optional[List[RayActor]] = None
+    subordinate_workers: Optional[List[ModelInstanceSubordinateWorker]] = None
 
     def to_log_string(self) -> str:
-        log_dict = {
-            "worker": f"worker: {self.worker.name}",
-            "gpu_indexes": (
-                f"gpu_indexes: {self.gpu_indexes}"
-                if self.gpu_indexes is not None
-                else None
-            ),
-            "offload_layers": (
-                f"offload layers: {self.computed_resource_claim.offload_layers}"
-                if self.computed_resource_claim.offload_layers is not None
-                else None
-            ),
-            "tensor_split": (
+        log_entries = [
+            f"worker: '{self.worker.name}'",
+        ]
+        if self.gpu_indexes:
+            log_entries.append(f"gpu_indexes: {self.gpu_indexes}")
+        if self.gpu_addresses:
+            log_entries.append(f"gpu_addresses: {self.gpu_addresses}")
+        if self.computed_resource_claim.offload_layers:
+            log_entries.append(
+                f"offload_layers: {self.computed_resource_claim.offload_layers}"
+            )
+        if self.computed_resource_claim.tensor_split:
+            log_entries.append(
                 f"tensor_split: {self.computed_resource_claim.tensor_split}"
-                if self.computed_resource_claim.tensor_split is not None
-                else None
-            ),
-            "rpcs": None,
-        }
+            )
+        if self.overcommit:
+            log_entries.append("overcommit: true")
 
-        if self.rpc_servers:
-            rpcs_string = ', '.join(
+        if self.subordinate_workers:
+            sw_str = '), ('.join(
                 [
-                    f"(worker_id: {rpc.worker_id}, gpu_index:{rpc.gpu_index}, offload layers:{rpc.computed_resource_claim.offload_layers})"
-                    for rpc in self.rpc_servers
+                    f"worker_id: {sw.worker_id}, "
+                    f"worker_name: {sw.worker_name}, "
+                    f"worker_ip: {sw.worker_ip}, "
+                    f"total_gpus: {sw.total_gpus}, "
+                    f"gpu_indexes: {sw.gpu_indexes}, "
+                    f"gpu_addresses: {sw.gpu_addresses}"
+                    for sw in self.subordinate_workers
                 ]
             )
-            log_dict["rpcs"] = f"rpcs: [{rpcs_string}]"
+            log_entries.append(f"subordinate_workers: [{sw_str}]")
 
-        log_parts = [value for value in log_dict.values() if value is not None]
-
-        return ', '.join(log_parts)
+        return ', '.join(log_entries)
 
 
 @dataclass
@@ -114,6 +114,14 @@ class WorkerFilterChain:
 
 
 class ScheduleCandidatesSelector(ABC):
+    @abstractmethod
+    def get_messages(self) -> List[str]:
+        """
+        Get diagnostic messages from the selector.
+        :return: A list of diagnostic messages.
+        """
+        pass
+
     @abstractmethod
     async def select_candidates(
         self, workers: List[Worker]

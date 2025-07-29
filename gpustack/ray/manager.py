@@ -2,10 +2,10 @@ import asyncio
 import logging
 import os
 import subprocess
-import sysconfig
 from urllib.parse import urlsplit
 from gpustack.config import Config
 from gpustack.utils.network import parse_port_range
+from gpustack.utils.command import get_command_path
 
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class RayManager:
         self._pure_head = pure_head
         self._role = "head" if head else "worker"
         if not head:
-            self._ray_address = get_ray_address(cfg.server_url, 40096)
+            self._ray_address = get_ray_address(cfg.server_url, cfg.ray_port)
 
         self._ray_args = cfg.ray_args
         self._ray_process = None
@@ -51,7 +51,11 @@ class RayManager:
     async def _start_ray(self):
         logger.info(f"Starting Ray {self._role}.")
 
-        command_path = os.path.join(sysconfig.get_path("scripts"), "ray")
+        min_worker_port, max_worker_port = parse_port_range(
+            self._cfg.ray_worker_port_range
+        )
+
+        command_path = get_command_path('ray')
         arguments = [
             "start",
             "--block",
@@ -59,6 +63,16 @@ class RayManager:
             str(self._cfg.ray_node_manager_port),
             "--object-manager-port",
             str(self._cfg.ray_object_manager_port),
+            "--dashboard-agent-grpc-port",
+            str(self._cfg.ray_dashboard_agent_grpc_port),
+            "--dashboard-agent-listen-port",
+            str(self._cfg.ray_dashboard_agent_listen_port),
+            "--metrics-export-port",
+            str(self._cfg.ray_metrics_export_port),
+            "--min-worker-port",
+            str(min_worker_port),
+            "--max-worker-port",
+            str(max_worker_port),
         ]
         if self._head:
             arguments.extend(
@@ -68,20 +82,15 @@ class RayManager:
                     str(self._cfg.ray_port),
                     "--ray-client-server-port",
                     str(self._cfg.ray_client_server_port),
+                    "--dashboard-port",
+                    str(self._cfg.ray_dashboard_port),
                 ]
             )
         else:
-            min_worker_port, max_worker_port = parse_port_range(
-                self._cfg.ray_worker_port_range
-            )
             arguments.extend(
                 [
                     "--address",
                     self._ray_address,
-                    "--min-worker-port",
-                    str(min_worker_port),
-                    "--max-worker-port",
-                    str(max_worker_port),
                 ]
             )
 

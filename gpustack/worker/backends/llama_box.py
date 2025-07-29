@@ -16,26 +16,46 @@ from gpustack.schemas.models import (
     is_image_model,
     is_renaker_model,
 )
-from gpustack.utils.command import find_parameter, get_versioned_command
+from gpustack.utils.command import find_parameter
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.worker.backends.base import InferenceServer
+from gpustack.worker.tools_manager import (
+    get_llama_box_command,
+    is_disabled_dynamic_link,
+    BUILTIN_LLAMA_BOX_VERSION,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class LlamaBoxServer(InferenceServer):
     def start(self):  # noqa: C901
-        command_path = pkg_resources.files(
-            "gpustack.third_party.bin.llama-box"
-        ).joinpath(get_llama_box_command())
-
-        if self._model.backend_version:
-            command_path = os.path.join(
-                self._config.bin_dir,
-                get_versioned_command(
-                    get_llama_box_command(), self._model.backend_version
-                ),
+        # Launch llama-box from <third_party>/bin/llama-box/llama-box-default,
+        # if allowing dynamic linking binary and builtin version is used,
+        # otherwise use the user-provided binary path in the config,
+        # i.e. <bin_dir>/llama-box/llama-box-<version> or <bin_dir>/llama-box/static/llama-box-<version>.
+        version = (
+            self._model.backend_version
+            if self._model.backend_version
+            else BUILTIN_LLAMA_BOX_VERSION
+        )
+        disabled_dynamic_link = (
+            is_disabled_dynamic_link(version) and self._config.bin_dir is not None
+        )
+        if not disabled_dynamic_link and version == BUILTIN_LLAMA_BOX_VERSION:
+            base_path = str(
+                pkg_resources.files("gpustack.third_party.bin").joinpath(
+                    'llama-box/llama-box-default'
+                )
             )
+        else:
+            base_path = os.path.join(
+                self._config.bin_dir,
+                'llama-box',
+                f'{"static" if disabled_dynamic_link else ""}',
+                f'llama-box-{version}',
+            )
+        command_path = get_llama_box_command(base_path)
 
         layers = -1
         claim = self._model_instance.computed_resource_claim
@@ -83,6 +103,10 @@ class LlamaBoxServer(InferenceServer):
         default_mmproj = get_mmproj_file(self._model_path)
         if mmproj is None and default_mmproj:
             arguments.extend(["--mmproj", default_mmproj])
+            # Enable `--max-projected-cache` to optimize chatting experience,
+            # cause llama-box will ignore unknown parameters,
+            # we can safely add this parameter without breaking previous version.
+            arguments.extend(["--max-projected-cache", "10"])
 
         if rpc_servers:
             rpc_servers_argument = ",".join(rpc_servers)
@@ -139,11 +163,18 @@ class LlamaBoxServer(InferenceServer):
                 )
 
             env = self.get_inference_running_env()
+            cwd = str(command_path.parent)
+            if platform.system() == "linux":
+                ld_library_path = env.get("LD_LIBRARY_PATH", "")
+                env["LD_LIBRARY_PATH"] = (
+                    ":".join([cwd, ld_library_path]) if ld_library_path else cwd
+                )
             proc = subprocess.Popen(
                 [command_path] + arguments,
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 env=env,
+                cwd=cwd,
             )
 
             set_priority(proc.pid)
@@ -172,7 +203,7 @@ class LlamaBoxServer(InferenceServer):
 
         model_dir = Path(self._model_path).parent
         mmproj_param = "--mmproj"
-        for i, param in enumerate(self._model.backend_parameters):
+        for i, param in enumerate(self._model.backend_parameters or []):
             if '=' in param:
                 key, value = param.split('=', 1)
                 if key == mmproj_param and value and not Path(value).is_absolute():
@@ -212,13 +243,6 @@ def set_priority(pid: int):
         logger.error(f"Failed to set priority for process {pid}: {e}")
 
 
-def get_llama_box_command():
-    command = "llama-box"
-    if platform.system() == "windows":
-        command += ".exe"
-    return command
-
-
 def get_rpc_servers(
     model_instance: ModelInstance, worker_map: Dict[int, Worker]
 ) -> Tuple[List[str], List[int]]:
@@ -226,12 +250,12 @@ def get_rpc_servers(
     rpc_tensor_split = []
     if (
         model_instance.distributed_servers
-        and model_instance.distributed_servers.rpc_servers
+        and model_instance.distributed_servers.subordinate_workers
     ):
-        for rpc_server in model_instance.distributed_servers.rpc_servers:
+        for rpc_server in model_instance.distributed_servers.subordinate_workers:
             r_worker = worker_map.get(rpc_server.worker_id)
             r_ip = r_worker.ip
-            r_port = r_worker.status.rpc_servers.get(rpc_server.gpu_index).port
+            r_port = r_worker.status.rpc_servers.get(rpc_server.gpu_indexes[0]).port
             r_ts = list((rpc_server.computed_resource_claim or {}).vram.values())
 
             rpc_tensor_split.extend(r_ts)

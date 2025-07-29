@@ -3,7 +3,9 @@ name: Docker CI
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "v*-dev"
     tags: ["*.*.*"]
     paths-ignore:
       - "mkdocs.yml"
@@ -16,7 +18,9 @@ on:
       - "Dockerfile.rocm.base"
       - "Dockerfile.dcu.base"
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - "v*-dev"
     paths:
       - "Dockerfile"
       - "Dockerfile.*"
@@ -44,19 +48,14 @@ jobs:
             tag_suffix: ""
             build_args:
               - "CUDA_VERSION=12.4.1"
+              - "CUDA_DEVEL_VERSION=12.6.3"
           - device: cuda
             dockerfile: "Dockerfile"
             platforms: "linux/amd64,linux/arm64"
             tag_suffix: "-cuda12.8"
             build_args:
               - "CUDA_VERSION=12.8.1"
-          - device: cuda
-            dockerfile: "Dockerfile"
-            platforms: "linux/amd64,linux/arm64"
-            tag_suffix: "-cuda11.8"
-            build_args:
-              - "CUDA_VERSION=11.8.0"
-              - "CUDA_TAG_SUFFIX=-cudnn8-runtime-ubuntu22.04"
+              - "CUDA_DEVEL_VERSION=12.8.1"
           #
           # HIP RoCM
           #
@@ -86,7 +85,7 @@ jobs:
           #
           - device: musa
             dockerfile: "Dockerfile.musa"
-            platforms: "linux/amd64,linux/arm64"
+            platforms: "linux/amd64"
             tag_suffix: "-musa"
             build_args: []
           #
@@ -104,6 +103,14 @@ jobs:
             dockerfile: "Dockerfile.cpu"
             platforms: "linux/amd64,linux/arm64"
             tag_suffix: "-cpu"
+            build_args: []
+          #
+          # Iluvatar Corex
+          #
+          - device: corex
+            dockerfile: "Dockerfile.corex"
+            platforms: "linux/amd64"
+            tag_suffix: "-corex"
             build_args: []
 
     steps:
@@ -154,8 +161,62 @@ jobs:
             echo "$arg" >> $GITHUB_OUTPUT
           done
           echo "EOF" >> $GITHUB_OUTPUT
+      - name: Get Cache Ref
+        id: cache-ref
+        run: |
+          #
+          # Use different cache ref for different branches.
+          #
+          # Examples:
+          # CACHE_FROM_REF
+          #   - vX.Y.Z                 -> "gpustack/build-cache:gpustack${TAG_SUFFIX}-${VERSION|DEFAULT_BRANCH}"
+          #   - PR/PUSH to branch      -> "gpustack/build-cache:gpustack${TAG_SUFFIX}-${BRANCH|DEFUALT_BRANCH}"
+          # CACHE_TO_REF
+          #   - vX.Y.Z                 -> "gpustack/build-cache:gpustack${TAG_SUFFIX}-${VERSION}"
+          #   - PUSH to branch         -> "gpustack/build-cache:gpustack${TAG_SUFFIX}-${BRANCH}"
+          #
+          # Stories(device cpu):
+          # CACHE_FROM_REF
+          #   - Release tag v0.7.0rc1      -> gpustack/build-cache:gpustack-cpu-v0.7, if not found, fallback to gpustack/build-cache:gpustack-cpu-main
+          #   - Release tag v0.7.0         -> gpustack/build-cache:gpustack-cpu-v0.7
+          #   - PR to "main" branch        -> gpustack/build-cache:gpustack-cpu-main
+          #   - PR to "v0.7-dev" branch    -> gpustack/build-cache:gpustack-cpu-v0.7, if not found, fallback to gpustack/build-cache:gpustack-cpu-main
+          #   - Push to "main" branch      -> gpustack/build-cache:gpustack-cpu-main
+          #   - Push to "v0.7-dev" branch  -> gpustack/build-cache:gpustack-cpu-v0.7, if not found, fallback to gpustack/build-cache:gpustack-cpu-main
+          # CACHE_TO_REF
+          #   - Release tag v0.7.0rc1      -> gpustack/build-cache:gpustack-cpu-v0.7
+          #   - Release tag v0.7.0         -> gpustack/build-cache:gpustack-cpu-v0.7
+          #   - PR to "main" branch        -> gpustack/build-cache:gpustack-cpu-main
+          #   - PR to "v0.7-dev" branch    -> gpustack/build-cache:gpustack-cpu-v0.7
+          #   - Push to "main" branch      -> gpustack/build-cache:gpustack-cpu-main
+          #   - Push to "v0.7-dev" branch  -> gpustack/build-cache:gpustack-cpu-v0.7
+          DEFAULT_BRANCH="main"
+          TAG_SUFFIX="${{ matrix.tag_suffix }}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            REF="${GITHUB_REF#refs/tags/}"
+            IFS="." read -r VERSION_MAJOR VERSION_MINOR VERSION_PATCH <<< "${REF}"
+            VERSION="${VERSION_MAJOR}.${VERSION_MINOR}"
+            CACHE_FROM_REF="gpustack/build-cache:gpustack${TAG_SUFFIX}-${VERSION}"
+            CACHE_TO_REF="${CACHE_FROM_REF}"
+          else
+            REF="${GITHUB_BASE_REF:-${GITHUB_REF}}"
+            BRANCH="${REF#refs/heads/}"
+            BRANCH="${BRANCH%-dev}"
+            CACHE_FROM_REF="gpustack/build-cache:gpustack${TAG_SUFFIX}-${BRANCH}"
+            CACHE_TO_REF="${CACHE_FROM_REF}"
+          fi
+          if ! docker manifest inspect "${CACHE_FROM_REF}" >/dev/null 2>&1; then
+            CACHE_FROM_REF="gpustack/build-cache:gpustack${TAG_SUFFIX}-${DEFAULT_BRANCH}"
+          fi
+          echo "CACHE_FROM_REF=${CACHE_FROM_REF}" >> $GITHUB_ENV
+          echo "CACHE_TO_REF=${CACHE_TO_REF}" >> $GITHUB_ENV
+          echo "DEBUG: GITHUB_BASE_REF=${GITHUB_BASE_REF}"
+          echo "DEBUG: GITHUB_REF=${GITHUB_REF}"
+          echo "DEBUG: TAG_SUFFIX=${TAG_SUFFIX}"
+          echo "DEBUG: CACHE_FROM_REF=${CACHE_FROM_REF}"
+          echo "DEBUG: CACHE_TO_REF=${CACHE_TO_REF}"
       - name: Package
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         id: package
         with:
           push: ${{ github.event_name != 'pull_request' }}
@@ -169,6 +230,6 @@ jobs:
           build-args: |
             ${{ steps.build-args.outputs.BUILD_ARGS }}
           cache-from: |
-            type=registry,ref=gpustack/build-cache:gpustack${{ matrix.tag_suffix }}
+            type=registry,ref=${{ env.CACHE_FROM_REF }}
           cache-to: |
-            ${{ github.event_name != 'pull_request' && format('type=registry,mode=max,oci-mediatypes=false,compression=gzip,ref=gpustack/build-cache:gpustack{0},ignore-error=true', matrix.tag_suffix) || '' }}
+            ${{ github.event_name != 'pull_request' && format('type=registry,mode=max,compression=gzip,ref={0},ignore-error=true', env.CACHE_TO_REF) || '' }}

@@ -92,13 +92,13 @@ Once the server and all workers are running, access the GPUStack UI via your bro
 http://your_gpustack_server_ip_or_hostname
 ```
 
-Log in using the `admin` username and the password obtained in Step 1. Navigate to the `Resources` page to verify that all workers are in the Ready state and their GPUs are listed.
+Log in using the `admin` username and the password obtained in Step 1. Navigate to the `Workers` page to verify that all workers are in the Ready state and their GPUs are listed.
 
 ![initial-resources](../assets/tutorials/running-deepseek-r1-671b-with-distributed-vllm/initial-resources.png)
 
 ## Step 4: Deploy the DeepSeek R1 Model
 
-1. Go to the `Models` page.
+1. Go to the `Deployments` page.
 2. Click `Deploy Model`.
 3. Select `Local Path` as your source.
 4. Enter a name (e.g., `DeepSeek-R1`) in the `Name` field.
@@ -110,11 +110,11 @@ Log in using the `admin` username and the password obtained in Step 1. Navigate 
 
 ## Step 5: Monitor Deployment
 
-You can monitor the deployment status on the `Models` page. Hover over `distributed across workers` to view GPU and worker usage. Click `View Logs` to see real-time logs showing model loading progress. It may take a few minutes to load the model.
+You can monitor the deployment status on the `Deployments` page. Hover over `distributed across workers` to view GPU and worker usage. Click `View Logs` to see real-time logs showing model loading progress. It may take a few minutes to load the model.
 
 ![model-info](../assets/tutorials/running-deepseek-r1-671b-with-distributed-vllm/model-info.png)
 
-After the model is running, revisit the Resources tab to check GPU utilization. By default, vLLM uses 90% of GPU memory. You may adjust this in the model configuration settings.
+After the model is running, navigate to the `Workers` page to check GPU utilization. By default, vLLM uses 90% of GPU memory. You may adjust this in the model configuration settings.
 
 ![resources-loaded](../assets/tutorials/running-deepseek-r1-671b-with-distributed-vllm/resources-loaded.png)
 

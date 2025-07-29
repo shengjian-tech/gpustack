@@ -10,6 +10,8 @@ from gpustack.detectors.fastfetch.fastfetch import Fastfetch
 from gpustack.detectors.npu_smi.npu_smi import NPUSMI
 from gpustack.detectors.rocm_smi.rocm_smi import RocmSMI
 from gpustack.detectors.regredit.regredit import Regredit
+from gpustack.detectors.ixsmi.ixsmi import IXSMI
+from gpustack.detectors.cnmon.cnmon import Cnmon
 from gpustack.utils import platform
 
 
@@ -31,7 +33,7 @@ class DetectorFactory:
 
         self._validate_detectors()
 
-    def _get_builtin_gpu_detectors(self) -> Dict[str, GPUDetector]:
+    def _get_builtin_gpu_detectors(self) -> Dict[str, List[GPUDetector]]:
         fastfetch = Fastfetch()
         return {
             platform.DeviceTypeEnum.CUDA.value: [NvidiaSMI()],
@@ -40,6 +42,8 @@ class DetectorFactory:
             platform.DeviceTypeEnum.MUSA.value: [fastfetch],
             platform.DeviceTypeEnum.ROCM.value: [RocmSMI(), Regredit()],
             platform.DeviceTypeEnum.DCU.value: [RocmSMI()],
+            platform.DeviceTypeEnum.COREX.value: [IXSMI()],
+            platform.DeviceTypeEnum.MLU.value: [Cnmon()],
         }
 
     def _validate_detectors(self):
@@ -76,5 +80,12 @@ class DetectorFactory:
         return self.system_info_detector.gather_system_info()
 
     def _filter_gpu_devices(self, gpu_devices: GPUDevicesInfo) -> GPUDevicesInfo:
-        # Ignore the device without memory.
-        return [device for device in gpu_devices if device.memory.total > 0]
+        filtered: GPUDevicesInfo = []
+        for device in gpu_devices:
+            if not device.memory or not device.memory.total or device.memory.total <= 0:
+                logger.debug(
+                    f"Skipping GPU device {device.name} ({device.device_index}, {device.device_chip_index}) due to invalid memory info"
+                )
+                continue
+            filtered.append(device)
+        return filtered

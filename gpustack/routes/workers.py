@@ -6,7 +6,7 @@ from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
 )
-from gpustack.server.deps import ListParamsDep, SessionDep
+from gpustack.server.deps import ListParamsDep, SessionDep, EngineDep
 from gpustack.schemas.workers import (
     WorkerCreate,
     WorkerPublic,
@@ -21,7 +21,12 @@ router = APIRouter()
 
 @router.get("", response_model=WorkersPublic)
 async def get_workers(
-    session: SessionDep, params: ListParamsDep, name: str = None, search: str = None
+    engine: EngineDep,
+    session: SessionDep,
+    params: ListParamsDep,
+    name: str = None,
+    search: str = None,
+    uuid: str = None,
 ):
     fuzzy_fields = {}
     if search:
@@ -30,10 +35,12 @@ async def get_workers(
     fields = {}
     if name:
         fields = {"name": name}
+    if uuid:
+        fields["worker_uuid"] = uuid
 
     if params.watch:
         return StreamingResponse(
-            Worker.streaming(session, fields=fields, fuzzy_fields=fuzzy_fields),
+            Worker.streaming(engine, fields=fields, fuzzy_fields=fuzzy_fields),
             media_type="text/event-stream",
         )
 
@@ -64,10 +71,9 @@ async def create_worker(session: SessionDep, worker_in: WorkerCreate):
     try:
         worker_in.compute_state()
         worker = await Worker.create(session, worker_in)
+        return worker
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to create worker: {e}")
-
-    return worker
 
 
 @router.put("/{id}", response_model=WorkerPublic)
