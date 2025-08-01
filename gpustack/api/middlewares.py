@@ -89,6 +89,13 @@ class ModelUsageMiddleware(BaseHTTPMiddleware):
                     FileResponse,
                     OperationEnum.AUDIO_SPEECH,
                 )
+            elif path == "/v1-openai/audio/copy" or path == "/v1/audio/copy":
+                return await process_request(
+                    request,
+                    response,
+                    FileResponse,
+                    OperationEnum.AUDIO_COPY,
+                )
             elif (
                 path == "/v1-openai/audio/transcriptions"
                 or path == "/v1/audio/transcriptions"

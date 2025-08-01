@@ -14,6 +14,7 @@ class OperationEnum(str, Enum):
     RERANK = "rerank"
     IMAGE_GENERATION = "image_generation"
     AUDIO_SPEECH = "audio_speech"
+    AUDIO_COPY = "audio_copy"
     AUDIO_TRANSCRIPTION = "audit_transcription"
 
 
