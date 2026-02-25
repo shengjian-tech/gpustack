@@ -90,6 +90,7 @@ openai_model_prefixes: List[RoutePrefix] = [
             "/embeddings",
             "/audio/transcriptions",
             "/audio/speech",
+            "/audio/copy",
             "/images/generations",
             "/images/edits",
         ]
