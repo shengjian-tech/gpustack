@@ -1,13 +1,16 @@
+import pytest
 from tenacity import retry, stop_after_attempt, wait_fixed
 from gpustack.utils.hub import (
     get_hugging_face_model_min_gguf_path,
     get_model_scope_model_min_gguf_path,
     get_model_weight_size,
+    read_repo_file_content,
 )
 from gpustack.schemas.models import (
     Model,
     SourceEnum,
 )
+from tests.utils.model import new_model
 
 
 def test_get_hub_model_weight_size():
@@ -56,13 +59,6 @@ def test_get_hub_model_weight_size():
         ),
         (
             Model(
-                source=SourceEnum.HUGGING_FACE,
-                huggingface_repo_id="FunAudioLLM/CosyVoice2-0.5B",
-            ),
-            3_545_354_370,
-        ),
-        (
-            Model(
                 source=SourceEnum.MODEL_SCOPE,
                 model_scope_model_id="Qwen/Qwen2-0.5B-Instruct",
             ),
@@ -108,7 +104,9 @@ def test_get_hub_model_weight_size():
                 source=SourceEnum.MODEL_SCOPE,
                 model_scope_model_id="gpustack/CosyVoice2-0.5B",
             ),
-            3_545_354_370,
+            2_557_256_546,
+            # The CosyVoice2-0.5B repository contains a subdirectory named CosyVoice-BlankEN,
+            # which is optional and should be excluded from weight calculations.
         ),
     ]
 
@@ -184,3 +182,29 @@ def test_get_ms_min_gguf_file():
         assert (
             got == expected_file_path
         ), f"min GGUF file path mismatch for modelscope model {model}, got: {got}, expected: {expected_file_path}"
+
+
+@pytest.mark.parametrize(
+    "m, file, token, predicate",
+    [
+        (
+            new_model(
+                id=1,
+                name="test_name",
+                huggingface_repo_id="Qwen/Qwen3-0.6B",
+            ),
+            "config.json",
+            None,
+            lambda content: "Qwen3ForCausalLM" in content.get("architectures", []),
+        ),
+        (
+            new_model(id=2, name="test_name2", model_scope_model_id="Qwen/Qwen3-0.6B"),
+            "config.json",
+            None,
+            lambda content: "Qwen3ForCausalLM" in content.get("architectures", []),
+        ),
+    ],
+)
+def test_read_repo_file_content(m, file, token, predicate):
+    config_dict = read_repo_file_content(m, file, token)
+    assert predicate(config_dict)

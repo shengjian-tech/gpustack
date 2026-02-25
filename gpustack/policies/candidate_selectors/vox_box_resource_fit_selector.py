@@ -1,16 +1,22 @@
 from abc import ABC, abstractmethod
 import asyncio
+from typing import Dict, List
+import os
+import logging
+
+from gpustack_runtime.detector import ManufacturerEnum
+
 from gpustack.config.config import Config
 from gpustack.utils.convert import safe_int
 from gpustack.utils.file import get_local_file_size_in_byte
 from gpustack.utils.gpu import parse_gpu_id
 from gpustack.utils.hub import get_model_weight_size
-from typing import Dict, List
-import os
-import logging
-
+from gpustack.utils.unit import byte_to_gib
+from gpustack.policies.utils import get_vram_claim_from_model_env
 from gpustack.policies.base import (
     ModelInstanceScheduleCandidate,
+)
+from gpustack.policies.candidate_selectors.base_candidate_selector import (
     ScheduleCandidatesSelector,
 )
 from gpustack.policies.utils import (
@@ -19,10 +25,9 @@ from gpustack.policies.utils import (
 from gpustack.schemas.models import (
     ComputedResourceClaim,
     Model,
+    ModelInstance,
 )
-from gpustack.schemas.workers import VendorEnum, Worker
-
-from gpustack.server.db import get_engine
+from gpustack.schemas.workers import Worker
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +40,10 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
         self,
         config: Config,
         model: Model,
+        model_instances: List[ModelInstance],
         cache_dir: str,
     ):
-        self._cfg = config
-        self._engine = get_engine()
-        self._model = model
+        super().__init__(config, model, model_instances=model_instances)
         self._cache_dir = os.path.join(cache_dir, "vox-box")
         self._messages = []
 
@@ -57,7 +61,14 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
                 self._selected_gpu_index = safe_int(match.get("gpu_index"))
 
     def _set_messages(self):
-        self._messages = ["No workers meet the resource requirements."]
+        ram_message = ""
+        requirement_message = ""
+        if self._cpu_ram_claim and self._cpu_ram_claim > 0:
+            ram_message = f" and {byte_to_gib(self._gpu_ram_claim)} GiB of RAM"
+        if self._gpu_vram_claim and self._gpu_vram_claim > 0:
+            requirement_message = f"The model requires {byte_to_gib(self._gpu_vram_claim)} GiB of VRAM{ram_message}."
+            self._messages.append(requirement_message)
+        self._messages.append("No workers meet the resource requirements.")
 
     def get_messages(self) -> List[str]:
         return self._messages
@@ -72,7 +83,7 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
         timeout_in_seconds = 15
         resource_claim = await asyncio.wait_for(
             asyncio.to_thread(
-                estimate_model_resource, self._cfg, self._model, self._cache_dir
+                estimate_model_resource, self._config, self._model, self._cache_dir
             ),
             timeout=timeout_in_seconds,
         )
@@ -97,14 +108,14 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
                 f"model {self._model.readable_source}, filter candidates with resource fit selector: {candidate_func.__name__}"
             )
 
-            candidates = await candidate_func(workers)
+            candidates = candidate_func(workers)
             if candidates:
                 return candidates
 
         self._set_messages()
         return []
 
-    async def find_single_worker_single_gpu_candidates(
+    def find_single_worker_single_gpu_candidates(
         self, workers: List[Worker]
     ) -> List[ModelInstanceScheduleCandidate]:
         """
@@ -116,13 +127,13 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
             if not worker.status.gpu_devices:
                 continue
 
-            result = await self._find_single_worker_single_gpu_candidates(worker)
+            result = self._find_single_worker_single_gpu_candidates(worker)
             if result:
                 candidates.extend(result)
 
         return candidates
 
-    async def _find_single_worker_single_gpu_candidates(
+    def _find_single_worker_single_gpu_candidates(
         self, worker: Worker
     ) -> List[ModelInstanceScheduleCandidate]:
         """
@@ -142,7 +153,7 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
         ):
             return []
 
-        allocatable = await get_worker_allocatable_resource(self._engine, worker)
+        allocatable = get_worker_allocatable_resource(self._model_instances, worker)
         is_unified_memory = worker.status.memory.is_unified_memory
 
         if self._gpu_ram_claim > allocatable.ram:
@@ -156,7 +167,7 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
                 ):
                     continue
 
-                if gpu.vendor != VendorEnum.NVIDIA.value:
+                if gpu.vendor != ManufacturerEnum.NVIDIA.value:
                     continue
 
                 gpu_index = gpu.index
@@ -172,6 +183,7 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
                     ModelInstanceScheduleCandidate(
                         worker=worker,
                         gpu_indexes=[gpu_index],
+                        gpu_type=gpu.type,
                         computed_resource_claim=ComputedResourceClaim(
                             vram={gpu_index: int(self._gpu_vram_claim)},
                             ram=self._gpu_ram_claim,
@@ -182,20 +194,23 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
 
         return candidates
 
-    async def find_single_worker_cpu_candidates(
+    def find_single_worker_cpu_candidates(
         self, workers: List[Worker]
     ) -> List[ModelInstanceScheduleCandidate]:
         """
         Find single worker without offloading candidates for the model instance with workers.
         """
+        if not self._model.cpu_offloading:
+            return []
+
         candidates = []
         for worker in workers:
-            result = await self._find_single_worker_with_cpu_candidates(worker)
+            result = self._find_single_worker_with_cpu_candidates(worker)
             if result:
                 candidates.extend(result)
         return candidates
 
-    async def _find_single_worker_with_cpu_candidates(
+    def _find_single_worker_with_cpu_candidates(
         self, worker: Worker
     ) -> List[ModelInstanceScheduleCandidate]:
         """
@@ -209,7 +224,7 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
         ):
             return []
 
-        allocatable = await get_worker_allocatable_resource(self._engine, worker)
+        allocatable = get_worker_allocatable_resource(self._model_instances, worker)
         is_unified_memory = worker.status.memory.is_unified_memory
 
         if self._cpu_ram_claim > allocatable.ram:
@@ -229,6 +244,24 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
 
 
 def estimate_model_resource(cfg: Config, model: Model, cache_dir: str) -> dict:
+    """
+    Estimate the model resource requirement using vox_box.
+    If the model has GPUSTACK_MODEL_VRAM_CLAIM env var, use it directly.
+    Otherwise, use vox_box to estimate the model resource requirement.
+
+    Returns:
+        A dict of resource requirement, e.g.:
+        {"cuda": {"vram": 1073741824, "ram": 1073741824}, "cpu": {"ram": 12 * Gib}, "os": ["linux"]}
+    """
+    env_vram_claim = get_vram_claim_from_model_env(model)
+    if env_vram_claim is not None:
+        return {
+            "cuda": {
+                "vram": env_vram_claim,
+                "ram": 0,
+            }
+        }
+
     try:
         from vox_box.estimator.estimate import estimate_model
         from vox_box.config import Config as VoxBoxConfig

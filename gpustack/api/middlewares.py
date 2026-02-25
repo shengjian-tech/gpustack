@@ -21,10 +21,10 @@ from gpustack.schemas.images import ImageGenerationChunk, ImagesResponse
 from gpustack.schemas.model_usage import ModelUsage, OperationEnum
 from gpustack.schemas.models import Model
 from gpustack.schemas.users import User
-from gpustack.security import JWT_TOKEN_EXPIRE_MINUTES, JWTManager
+from gpustack.security import JWTManager
+from gpustack import envs
 from gpustack.api.auth import SESSION_COOKIE_NAME
-from gpustack.server.db import get_engine
-from sqlmodel.ext.asyncio.session import AsyncSession
+from gpustack.server.db import async_session
 
 from gpustack.server.services import ModelUsageService
 from gpustack.api.types.openai_ext import CreateEmbeddingResponseExt, CompletionExt
@@ -181,6 +181,7 @@ async def record_model_usage(
     fields = {
         "user_id": user.id,
         "model_id": model.id,
+        "model_name": model.name,
         "date": date.today(),
         "operation": operation,
     }
@@ -190,7 +191,7 @@ async def record_model_usage(
         prompt_token_count=prompt_tokens,
         request_count=1,
     )
-    async with AsyncSession(get_engine()) as session:
+    async with async_session() as session:
         model_usage_service = ModelUsageService(session)
         current_model_usage = await model_usage_service.get_by_fields(fields)
         if current_model_usage:
@@ -282,11 +283,14 @@ def add_metrics(response_dict, request, response_chunk):
     time_to_first_token_ms = (
         request.state.first_token_time - request.state.start_time
     ).total_seconds() * 1000
+
+    tokens_after_first = max(response_chunk.usage.completion_tokens - 1, 1)
     time_per_output_token_ms = (
         (now - request.state.first_token_time).total_seconds()
         * 1000
-        / max(response_chunk.usage.completion_tokens, 1)
+        / tokens_after_first
     )
+
     tokens_per_second = (
         1000 / time_per_output_token_ms if time_per_output_token_ms > 0 else 0
     )
@@ -320,8 +324,8 @@ class RefreshTokenMiddleware(BaseHTTPMiddleware):
                             key=SESSION_COOKIE_NAME,
                             value=new_token,
                             httponly=True,
-                            max_age=JWT_TOKEN_EXPIRE_MINUTES * 60,
-                            expires=JWT_TOKEN_EXPIRE_MINUTES * 60,
+                            max_age=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
+                            expires=envs.JWT_TOKEN_EXPIRE_MINUTES * 60,
                         )
             except (ExpiredSignatureError, DecodeError):
                 pass

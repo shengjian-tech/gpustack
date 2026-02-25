@@ -10,8 +10,8 @@
         <img alt="Documentation" src="https://img.shields.io/badge/Docs-GPUStack-blue?logo=readthedocs&logoColor=white"></a>
     <a href="./LICENSE" target="_blank">
         <img alt="License" src="https://img.shields.io/github/license/gpustack/gpustack?logo=github&logoColor=white&label=License&color=blue"></a>
-    <a href="./docs/assets/wechat-assistant.png" target="_blank">
-        <img alt="WeChat" src="https://img.shields.io/badge/微信群-GPUStack-blue?logo=wechat&logoColor=white"></a>
+    <a href="./docs/assets/wechat-group-qrcode.jpg" target="_blank">
+        <img alt="WeChat" src="https://img.shields.io/badge/WeChat-GPUStack-blue?logo=wechat&logoColor=white"></a>
     <a href="https://discord.gg/VXYJzuaqwD" target="_blank">
         <img alt="Discord" src="https://img.shields.io/badge/Discord-GPUStack-blue?logo=discord&logoColor=white"></a>
     <a href="https://twitter.com/intent/follow?screen_name=gpustack_ai" target="_blank">
@@ -27,62 +27,138 @@
 
 <br>
 
-![demo](https://raw.githubusercontent.com/gpustack/gpustack/main/docs/assets/gpustack-demo.gif)
+## Overview
 
-GPUStack is an open-source GPU cluster manager for running AI models.
+GPUStack is an open-source GPU cluster manager designed for efficient AI model deployment. It lets you run models efficiently on your own GPU hardware by choosing the best inference engines, scheduling GPU resources, analyzing model architectures, and automatically configuring deployment parameters.
 
-### Key Features
+The following figure shows how GPUStack delivers improved inference throughput over the unoptimized vLLM baseline:
 
-- **Broad GPU Compatibility:** Seamlessly supports GPUs from various vendors across Apple Macs, Windows PCs, and Linux servers.
-- **Extensive Model Support:** Supports a wide range of models including LLMs, VLMs, image models, audio models, embedding models, and rerank models.
-- **Flexible Inference Backends:** Flexibly integrates with multiple inference backends including vLLM, Ascend MindIE, llama-box (llama.cpp & stable-diffusion.cpp) and vox-box.
-- **Multi-Version Backend Support:** Run multiple versions of inference backends concurrently to meet the diverse runtime requirements of different models.
-- **Distributed Inference:** Supports single-node and multi-node multi-GPU inference, including heterogeneous GPUs across vendors and runtime environments.
-- **Scalable GPU Architecture:** Easily scale up by adding more GPUs or nodes to your infrastructure.
-- **Robust Model Stability:** Ensures high availability with automatic failure recovery, multi-instance redundancy, and load balancing for inference requests.
-- **Intelligent Deployment Evaluation:** Automatically assess model resource requirements, backend and architecture compatibility, OS compatibility, and other deployment-related factors.
-- **Automated Scheduling:** Dynamically allocate models based on available resources.
-- **Lightweight Python Package:** Minimal dependencies and low operational overhead.
-- **OpenAI-Compatible APIs:** Fully compatible with OpenAI’s API specifications for seamless integration.
-- **User & API Key Management:** Simplified management of users and API keys.
-- **Real-Time GPU Monitoring:** Track GPU performance and utilization in real time.
-- **Token and Rate Metrics:** Monitor token usage and API request rates.
+![a100-throughput-comparison](docs/assets/a100-throughput-comparison.png)
 
-## Installation
+For detailed benchmarking methods and results, visit our [Inference Performance Lab](https://docs.gpustack.ai/latest/performance-lab/overview/).
 
-### Linux
+## Tested Inference Engines, GPUs, and Models
 
-If you are using NVIDIA GPUs, ensure [Docker](https://docs.docker.com/engine/install/) and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) are installed on your system. Then, run the following command to start the GPUStack server.
+GPUStack uses a plug-in architecture that makes it easy to add new AI models, inference engines, and GPU hardware. We work closely with partners and the open-source community to test and optimize emerging models across different inference engines and GPUs. Below is the current list of supported inference engines, GPUs, and models, which will continue to expand over time.
+
+**Tested Inference Engines:**
+- vLLM
+- SGLang
+- TensorRT-LLM
+- MindIE
+
+**Tested GPUs:**
+- NVIDIA A100
+- NVIDIA H100/H200
+- Ascend 910B
+
+**Tuned Models:**
+- Qwen3
+- gpt-oss
+- GLM-4.5-Air
+- GLM-4.x
+- DeepSeek-R1
+- DeepSeek-V3.2
+
+## Architecture
+
+GPUStack enables development teams, IT organizations, and service providers to deliver Model-as-a-Service at scale. It supports industry-standard APIs for LLM, voice, image, and video models. The platform includes built-in user authentication and access control, real-time monitoring of GPU performance and utilization, and detailed metering of token usage and API request rates.
+
+The figure below illustrates how a single GPUStack server can manage multiple GPU clusters across both on-premises and cloud environments. The GPUStack scheduler allocates GPUs to maximize resource utilization and selects the appropriate inference engines for optimal performance. Administrators also gain full visibility into system health and metrics through integrated Grafana and Prometheus dashboards.
+
+![gpustack-v2-architecture](docs/assets/gpustack-v2-architecture.png)
+
+GPUStack provides a powerful framework for deploying AI models. Its core features include:
+- **Multi-Cluster GPU Management.** Manages GPU clusters across multiple environments. This includes on-premises servers, Kubernetes clusters, and cloud providers.
+- **Pluggable Inference Engines.** Automatically configures high-performance inference engines such as vLLM, SGLang, and TensorRT-LLM. You can also add custom inference engines as needed.
+- **Performance-Optimized Configurations.** Offers pre-tuned modes for low latency or high throughput. GPUStack supports extended KV cache systems like LMCache and HiCache to reduce TTFT. It also includes built-in support for speculative decoding methods such as EAGLE3, MTP, and N-grams.
+- **Enterprise-Grade Operations.** Offers support for automated failure recovery, load balancing, monitoring, authentication, and access control.
+
+## Quick Start
+
+### Prerequisites
+
+1. A node with at least one NVIDIA GPU. For other GPU types, please check the guidelines in the GPUStack UI when adding a worker, or refer to the [Installation documentation](https://docs.gpustack.ai/latest/installation/requirements/) for more details.
+2. Ensure the NVIDIA driver, [Docker](https://docs.docker.com/engine/install/) and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) are installed on the worker node.
+3. (Optional) A CPU node for hosting the GPUStack server. The GPUStack server does not require a GPU and can run on a CPU-only machine. [Docker](https://docs.docker.com/engine/install/) must be installed. Docker Desktop (for Windows and macOS) is also supported. If no dedicated CPU node is available, the GPUStack server can be installed on the same machine as a GPU worker node.
+4. Only Linux is supported for GPUStack worker nodes. If you use Windows, consider using WSL2 and avoid using Docker Desktop. macOS is not supported for GPUStack worker nodes.
+
+### Install GPUStack
+
+Run the following command to install and start the GPUStack server using Docker:
 
 ```bash
-docker run -d --name gpustack \
-      --restart=unless-stopped \
-      --gpus all \
-      --network=host \
-      --ipc=host \
-      -v gpustack-data:/var/lib/gpustack \
-      gpustack/gpustack
+sudo docker run -d --name gpustack \
+    --restart unless-stopped \
+    -p 80:80 \
+    --volume gpustack-data:/var/lib/gpustack \
+    gpustack/gpustack
 ```
 
-For more details on the installation or other GPU hardware platforms, please refer to the [Installation Documentation](installation/installation-requirements.md).
+<details>
+<summary>Alternative: Use Quay Container Registry Mirror</summary>
 
-After the server starts, run the following command to get the default admin password:
+If you cannot pull images from `Docker Hub` or the download is very slow, you can use our `Quay.io` mirror by pointing your registry to `quay.io`:
 
 ```bash
-docker exec gpustack cat /var/lib/gpustack/initial_admin_password
+sudo docker run -d --name gpustack \
+    --restart unless-stopped \
+    -p 80:80 \
+    --volume gpustack-data:/var/lib/gpustack \
+    quay.io/gpustack/gpustack \
+    --system-default-container-registry quay.io
+```
+</details>
+
+Check the GPUStack startup logs:
+
+```bash
+sudo docker logs -f gpustack
+```
+
+After GPUStack starts, run the following command to get the default admin password:
+
+```bash
+sudo docker exec gpustack cat /var/lib/gpustack/initial_admin_password
 ```
 
 Open your browser and navigate to `http://your_host_ip` to access the GPUStack UI. Use the default username `admin` and the password you retrieved above to log in.
 
-### macOS & Windows
+### Set Up a GPU Cluster
 
-A desktop installer is available for macOS and Windows — see the [documentation](https://docs.gpustack.ai/latest/installation/desktop-installer/) for installation details.
+1. On the GPUStack UI, navigate to the `Clusters` page.
 
-## Deploy a Model
+2. Click the `Add Cluster` button.
+
+3. Select `Docker` as the cluster provider.
+
+4. Fill in the `Name` and `Description` fields for the new cluster, then click the `Save` button.
+
+5. Follow the UI guidelines to configure the new worker node. You will need to run a Docker command on the worker node to connect it to the GPUStack server. The command will look similar to the following:
+
+    ```bash
+    sudo docker run -d --name gpustack-worker \
+          --restart=unless-stopped \
+          --privileged \
+          --network=host \
+          --volume /var/run/docker.sock:/var/run/docker.sock \
+          --volume gpustack-data:/var/lib/gpustack \
+          --runtime nvidia \
+          gpustack/gpustack \
+          --server-url http://your_gpustack_server_url \
+          --token your_worker_token \
+          --advertise-address 192.168.1.2
+    ```
+
+6. Execute the command on the worker node to connect it to the GPUStack server.
+
+7. After the worker node connects successfully, it will appear on the `Workers` page in the GPUStack UI.
+
+### Deploy a Model
 
 1. Navigate to the `Catalog` page in the GPUStack UI.
 
-2. Select the `Qwen3` model from the list of available models.
+2. Select the `Qwen3 0.6B` model from the list of available models.
 
 3. After the deployment compatibility checks pass, click the `Save` button to deploy the model.
 
@@ -92,11 +168,11 @@ A desktop installer is available for macOS and Windows — see the [documentatio
 
 ![model is running](docs/assets/quick-start/model-running.png)
 
-5. Click `Playground - Chat` in the navigation menu, check that the model `qwen3` is selected from the top-right `Model` dropdown. Now you can chat with the model in the UI playground.
+5. Click `Playground - Chat` in the navigation menu, check that the model `qwen3-0.6b` is selected from the top-right `Model` dropdown. Now you can chat with the model in the UI playground.
 
 ![quick chat](docs/assets/quick-start/quick-chat.png)
 
-## Use the model via API
+### Use the model via API
 
 1. Hover over the user avatar and navigate to the `API Keys` page, then click the `New API Key` button.
 
@@ -114,7 +190,7 @@ curl http://your_gpustack_server_url/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GPUSTACK_API_KEY" \
   -d '{
-    "model": "qwen3",
+    "model": "qwen3-0.6b",
     "messages": [
       {
         "role": "system",
@@ -128,78 +204,6 @@ curl http://your_gpustack_server_url/v1/chat/completions \
     "stream": true
   }'
 ```
-
-## Supported Platforms
-
-- [x] Linux
-- [x] macOS
-- [x] Windows
-
-## Supported Accelerators
-
-- [x] NVIDIA CUDA ([Compute Capability](https://developer.nvidia.com/cuda-gpus) 6.0 and above)
-- [x] Apple Metal (M-series chips)
-- [x] AMD ROCm
-- [x] Ascend CANN
-- [x] Hygon DTK
-- [x] Moore Threads MUSA
-- [x] Iluvatar Corex
-- [x] Cambricon MLU
-
-## Supported Models
-
-GPUStack uses [vLLM](https://github.com/vllm-project/vllm), [Ascend MindIE](https://www.hiascend.com/en/software/mindie), [llama-box](https://github.com/gpustack/llama-box) (bundled [llama.cpp](https://github.com/ggml-org/llama.cpp) and [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) server) and [vox-box](https://github.com/gpustack/vox-box) as the backends and supports a wide range of models. Models from the following sources are supported:
-
-1. [Hugging Face](https://huggingface.co/)
-
-2. [ModelScope](https://modelscope.cn/)
-
-3. Local File Path
-
-### Example Models
-
-| **Category**                     | **Models**                                                                                                                                                                                                                                                                                                                                       |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Large Language Models(LLMs)**  | [Qwen](https://huggingface.co/models?search=Qwen/Qwen), [LLaMA](https://huggingface.co/meta-llama), [Mistral](https://huggingface.co/mistralai), [DeepSeek](https://huggingface.co/models?search=deepseek-ai/deepseek), [Phi](https://huggingface.co/models?search=microsoft/phi), [Gemma](https://huggingface.co/models?search=Google/gemma)    |
-| **Vision Language Models(VLMs)** | [Llama3.2-Vision](https://huggingface.co/models?pipeline_tag=image-text-to-text&search=llama3.2), [Pixtral](https://huggingface.co/models?search=pixtral) , [Qwen2.5-VL](https://huggingface.co/models?search=Qwen/Qwen2.5-VL), [LLaVA](https://huggingface.co/models?search=llava), [InternVL3](https://huggingface.co/models?search=internvl3) |
-| **Diffusion Models**             | [Stable Diffusion](https://huggingface.co/models?search=gpustack/stable-diffusion), [FLUX](https://huggingface.co/models?search=gpustack/flux)                                                                                                                                                                                                   |
-| **Embedding Models**             | [BGE](https://huggingface.co/gpustack/bge-m3-GGUF), [BCE](https://huggingface.co/gpustack/bce-embedding-base_v1-GGUF), [Jina](https://huggingface.co/models?search=gpustack/jina-embeddings), [Qwen3-Embedding](https://huggingface.co/models?search=qwen/qwen3-embedding)                                                                       |
-| **Reranker Models**              | [BGE](https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF), [BCE](https://huggingface.co/gpustack/bce-reranker-base_v1-GGUF), [Jina](https://huggingface.co/models?search=gpustack/jina-reranker), [Qwen3-Reranker](https://huggingface.co/models?search=qwen/qwen3-reranker)                                                                |
-| **Audio Models**                 | [Whisper](https://huggingface.co/models?search=Systran/faster) (Speech-to-Text), [CosyVoice](https://huggingface.co/models?search=FunAudioLLM/CosyVoice) (Text-to-Speech)                                                                                                                                                                        |
-
-For full list of supported models, please refer to the supported models section in the [inference backends](https://docs.gpustack.ai/latest/user-guide/inference-backends/) documentation.
-
-## OpenAI-Compatible APIs
-
-GPUStack serves the following OpenAI compatible APIs under the `/v1-openai` path:
-
-- [x] [List Models](https://platform.openai.com/docs/api-reference/models/list)
-- [x] [Create Completion](https://platform.openai.com/docs/api-reference/completions/create)
-- [x] [Create Chat Completion](https://platform.openai.com/docs/api-reference/chat/create)
-- [x] [Create Embeddings](https://platform.openai.com/docs/api-reference/embeddings/create)
-- [x] [Create Image](https://platform.openai.com/docs/api-reference/images/create)
-- [x] [Create Image Edit](https://platform.openai.com/docs/api-reference/images/createEdit)
-- [x] [Create Speech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
-- [x] [Create Transcription](https://platform.openai.com/docs/api-reference/audio/createTranscription)
-
-For example, you can use the official [OpenAI Python API library](https://github.com/openai/openai-python) to consume the APIs:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://your_gpustack_server_url/v1-openai", api_key="your_api_key")
-
-completion = client.chat.completions.create(
-  model="llama3.2",
-  messages=[
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
-  ]
-)
-
-print(completion.choices[0].message)
-```
-
-GPUStack users can generate their own API keys in the UI.
 
 ## Documentation
 
@@ -223,7 +227,7 @@ Any issues or have suggestions, feel free to join our [Community](https://discor
 
 ## License
 
-Copyright (c) 2024 The GPUStack authors
+Copyright (c) 2024-2025 The GPUStack authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

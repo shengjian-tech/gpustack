@@ -8,7 +8,18 @@ from .filters import to_dash_plural, to_snake_case, to_plural, to_underscore_plu
 
 
 def main():
-    cfg = Config(class_names=["Worker", "Model", "ModelInstance", "ModelFile", "User"])
+    cfg = Config(
+        class_names=[
+            "Worker",
+            "Model",
+            "ModelInstance",
+            "ModelFile",
+            "User",
+            "InferenceBackend",
+            "Benchmark",
+            "ModelRouteTarget",
+        ]
+    )
 
     env = Environment(loader=FileSystemLoader(cfg.template_dir), auto_reload=True)
     env.filters["to_snake_case"] = to_snake_case
@@ -81,7 +92,8 @@ def reset(cfg: Config):
     output_dir = cfg.output_dir
     if os.path.exists(output_dir):
         for file in os.listdir(output_dir):
-            os.remove(os.path.join(output_dir, file))
+            if file == "__init__.py" or file.startswith("generated_"):
+                os.remove(os.path.join(output_dir, file))
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)

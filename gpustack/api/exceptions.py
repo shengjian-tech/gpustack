@@ -70,12 +70,35 @@ GatewayTimeoutException = http_exception_factory(
 )
 
 
+async def async_raise_if_response_error(response: httpx.Response):  # noqa: C901
+    if response.status_code < status.HTTP_400_BAD_REQUEST:
+        return
+    try:
+        await response.aread()
+    except httpx.ReadError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            reason="Unknown",
+            message=str(e),
+        )
+    raise_errors(response)
+
+
 def raise_if_response_error(response: httpx.Response):  # noqa: C901
     if response.status_code < status.HTTP_400_BAD_REQUEST:
         return
+    raise_errors(response)
 
+
+def raise_errors(response: httpx.Response):
     try:
-        error = ErrorResponse.model_validate(response.json())
+        response_json = response.json()
+        # Compatible with OpenAI API error format
+        if "error" in response_json and isinstance(response_json["error"], dict):
+            response_json = response_json["error"]
+            if "type" in response_json and isinstance(response_json["type"], str):
+                response_json["reason"] = response_json["type"]
+        error = ErrorResponse.model_validate(response_json)
     except Exception:
         raise HTTPException(response.status_code, "Unknown", response.text)
 

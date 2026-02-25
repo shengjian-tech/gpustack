@@ -22,7 +22,7 @@ async def test_generate_combinations_for_single_worker_gpus():
         linux_nvidia_8_3090_24gx8(),
     ]
 
-    m = new_model(1, "test", 1, "llama3:70b")
+    m = new_model(1, "test", 1, "Meta-Llama-3-70B-Instruct-GGUF")
     mi = new_model_instance(1, "test", 1)
 
     resource_fit_selector = GGUFResourceFitSelector(m, mi)
@@ -37,14 +37,12 @@ async def test_generate_combinations_for_single_worker_gpus():
         ),
     ):
 
-        allocatable = await resource_fit_selector._get_worker_allocatable_resource(
-            workers[0]
-        )
+        allocatable = resource_fit_selector._get_worker_allocatable_resource(workers[0])
 
         actual_combinations_count = {}
         for i in range(2, 9):
             combinations, _ = (
-                await resource_fit_selector._generate_combinations_for_single_worker_multi_gpus(
+                resource_fit_selector._generate_combinations_for_single_worker_multi_gpus(
                     allocatable, workers[0], i
                 )
             )
@@ -128,11 +126,9 @@ async def test_generate_combinations_for_worker_with_rpc_servers_with_manual_sel
         ),
     ):
 
-        await resource_fit_selector._set_workers_allocatable_resource(workers)
+        resource_fit_selector._set_workers_allocatable_resource(workers)
         combinations = (
-            await resource_fit_selector._generate_combinations_for_worker_with_rpcs(
-                workers
-            )
+            resource_fit_selector._generate_combinations_for_worker_with_rpcs(workers)
         )
 
         expected_total = 1
@@ -178,11 +174,9 @@ async def test_generate_combinations_for_worker_with_rpc_servers_with_auto_selec
         ),
     ):
 
-        await resource_fit_selector._set_workers_allocatable_resource(workers)
+        resource_fit_selector._set_workers_allocatable_resource(workers)
         combinations = (
-            await resource_fit_selector._generate_combinations_for_worker_with_rpcs(
-                workers
-            )
+            resource_fit_selector._generate_combinations_for_worker_with_rpcs(workers)
         )
 
         expected_total = 39202

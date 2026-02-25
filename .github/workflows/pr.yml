@@ -6,6 +6,7 @@ on:
       - main
       - "v*-dev"
     paths-ignore:
+      - ".github/ISSUE_TEMPLATE/**"
       - "mkdocs.yml"
       - "docs/**"
       - "**.md"
@@ -15,7 +16,7 @@ on:
       - "**.gif"
 
 jobs:
-  linux-macos:
+  linux-build:
     timeout-minutes: 20
     runs-on: ubuntu-latest
 
@@ -36,34 +37,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cache/pypoetry/artifacts
-            ~/.cache/pypoetry/repository
-            ~/.cache/pypoetry/virtualenvs
-          key: ${{ runner.os }}-poetry-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+            ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ matrix.python-version }}-${{ hashFiles('**/uv.lock') }}
           restore-keys: |
-            ${{ runner.os }}-poetry-${{ matrix.python-version }}-
+            ${{ runner.os }}-uv-${{ matrix.python-version }}-
 
       - name: Run CI build
-        run: |
-          make ci
-
-  windows:
-    timeout-minutes: 20
-    runs-on: windows-latest
-    strategy:
-      matrix:
-        python-version: ["3.12"]
-
-    steps:
-      - uses: actions/checkout@v4
-        name: Checkout code
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: CI
-        shell: powershell
         run: |
           make ci

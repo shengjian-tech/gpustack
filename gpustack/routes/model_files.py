@@ -1,7 +1,9 @@
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlmodel import String, cast, func, or_
+from pathlib import Path
+from sqlalchemy.orm import selectinload
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
@@ -9,10 +11,11 @@ from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
 )
-from gpustack.server.deps import ListParamsDep, SessionDep, EngineDep
+from gpustack.server.deps import SessionDep
 from gpustack.schemas.model_files import (
     ModelFile,
     ModelFileCreate,
+    ModelFileListParams,
     ModelFilePublic,
     ModelFileStateEnum,
     ModelFileUpdate,
@@ -24,9 +27,8 @@ router = APIRouter()
 
 @router.get("", response_model=ModelFilesPublic)
 async def get_model_files(
-    engine: EngineDep,
     session: SessionDep,
-    params: ListParamsDep,
+    params: ModelFileListParams = Depends(),
     search: str = None,
     worker_id: int = None,
 ):
@@ -43,7 +45,6 @@ async def get_model_files(
     if params.watch:
         return StreamingResponse(
             ModelFile.streaming(
-                engine,
                 fields=fields,
                 filter_func=get_filter_func(search),
             ),
@@ -63,9 +64,6 @@ async def get_model_files(
                     func.lower(ModelFile.huggingface_filename).like(
                         f"%{lower_search}%"
                     ),
-                    func.lower(ModelFile.ollama_library_model_name).like(
-                        f"%{lower_search}%"
-                    ),
                     func.lower(ModelFile.model_scope_model_id).like(
                         f"%{lower_search}%"
                     ),
@@ -77,12 +75,34 @@ async def get_model_files(
             )
         )
 
+    order_by = params.order_by
+
+    order_by = params.order_by
+    if order_by:
+        new_order_by = []
+        for field, direction in order_by:
+            if field == "source":
+                # When sorting by "source", add additional sorting fields for deterministic ordering
+                new_order_by.append((field, direction))
+                new_order_by.append(("huggingface_repo_id", direction))
+                new_order_by.append(("huggingface_filename", direction))
+                new_order_by.append(("model_scope_model_id", direction))
+                new_order_by.append(("model_scope_file_path", direction))
+                new_order_by.append(("local_path", direction))
+            elif field == "resolved_paths":
+                # resolved_paths is a JSON field, replace resolved_paths ordering with expression
+                new_order_by.append((cast(ModelFile.resolved_paths, String), direction))
+            else:
+                new_order_by.append((field, direction))
+        order_by = new_order_by
+
     return await ModelFile.paginated_by_query(
         session=session,
         fields=fields,
         extra_conditions=extra_conditions,
         page=params.page,
         per_page=params.perPage,
+        order_by=order_by,
     )
 
 
@@ -95,10 +115,6 @@ def search_model_file_filter(data: ModelFile, search: str) -> bool:
         or (
             data.huggingface_filename
             and search.lower() in data.huggingface_filename.lower()
-        )
-        or (
-            data.ollama_library_model_name
-            and search.lower() in data.ollama_library_model_name.lower()
         )
         or (
             data.model_scope_model_id
@@ -137,6 +153,26 @@ async def create_model_file(session: SessionDep, model_file_in: ModelFileCreate)
             message="Model file with the same model source already exists on the worker."
         )
 
+    if model_file_in.local_dir is not None:
+        fields = {
+            "worker_id": model_file_in.worker_id,
+            "local_dir": model_file_in.local_dir,
+        }
+        worker_existing_files = await ModelFile.all_by_field(
+            session, field="worker_id", value=model_file_in.worker_id
+        )
+        if worker_existing_files:
+            for file in worker_existing_files:
+                if (
+                    file.local_dir is not None
+                    and file.huggingface_filename is None
+                    and file.model_scope_file_path is None
+                    and Path(file.local_dir).resolve()
+                    == Path(model_file_in.local_dir).resolve()
+                ):
+                    raise AlreadyExistsException(
+                        message=f"The local directory {model_file_in.local_dir} is already occupied by {file.readable_source} on this worker."
+                    )
     try:
         model_file = ModelFile(
             **model_file_in.model_dump(), source_index=model_file_in.model_source_index
@@ -168,7 +204,9 @@ async def update_model_file(
 async def delete_model_file(
     session: SessionDep, id: int, cleanup: Optional[bool] = None
 ):
-    model_file = await ModelFile.one_by_id(session, id)
+    model_file = await ModelFile.one_by_id(
+        session, id, options=[selectinload(ModelFile.instances)]
+    )
     if not model_file:
         raise NotFoundException(message=f"Model file {id} not found")
 

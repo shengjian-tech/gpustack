@@ -1,13 +1,35 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, Optional
+from typing import ClassVar, Dict, Optional, Any
 from pydantic import ConfigDict, BaseModel
-from sqlmodel import Field, SQLModel, JSON, Column, Text
-
+from sqlmodel import (
+    Field,
+    SQLModel,
+    JSON,
+    Column,
+    Text,
+    Relationship,
+    Integer,
+    ForeignKey,
+)
+from sqlalchemy import String
+from gpustack import envs
 from gpustack.mixins import BaseModelMixin
-from gpustack.schemas.common import PaginatedList, UTCDateTime, pydantic_column_type
+from gpustack.schemas.common import (
+    ListParams,
+    PaginatedList,
+    UTCDateTime,
+    pydantic_column_type,
+)
 from typing import List
 from sqlalchemy.orm import declarative_base
+
+from gpustack.utils.network import is_offline
+from .clusters import ClusterProvider, Cluster, WorkerPool
+from gpustack.schemas.config import (
+    PredefinedConfigNoDefaults,
+    ModelInstanceProxyModeEnum,
+)
 
 Base = declarative_base()
 
@@ -47,41 +69,78 @@ class SwapInfo(UtilizationInfo):
 
 
 class GPUDeviceInfo(BaseModel):
-    # GPU index, which is the logic ID of the GPU chip,
-    # which is a human-readable index and counted from 0 generally.
-    # It might be recognized as the GPU device ID in some cases, when there is no more than one GPU chip on the same card.
-    index: Optional[int] = Field(default=None)
-    # GPU device index, which is the index of the onboard GPU device.
-    # In Linux, it can be retrieved under the /dev/ path.
-    # For example, /dev/nvidia0 (the first Nvidia card), /dev/davinci2(the third Ascend card), etc.
-    device_index: Optional[int] = Field(default=0)
-    # GPU device chip index, which is the index of the GPU chip on the card.
-    # It works with `device_index` to identify a GPU chip uniquely.
-    # For example, the first chip on the first card is 0, and the second chip on the first card is 1.
-    device_chip_index: Optional[int] = Field(default=0)
-    name: str = Field(default="")
-    uuid: Optional[str] = Field(default="")
     vendor: Optional[str] = Field(default="")
-    core: Optional[GPUCoreInfo] = Field(sa_column=Column(JSON), default=None)
-    memory: Optional[MemoryInfo] = Field(sa_column=Column(JSON), default=None)
-    network: Optional[GPUNetworkInfo] = Field(sa_column=Column(JSON), default=None)
-    temperature: Optional[float] = Field(default=None)  # in celsius
-    labels: Dict[str, str] = Field(sa_column=Column(JSON), default={})
+    """
+    Manufacturer of the GPU device, e.g. nvidia, amd, ascend, etc.
+    """
     type: Optional[str] = Field(default="")
+    """
+    Device runtime backend type, e.g. cuda, rocm, cann, etc.
+    """
+    index: Optional[int] = Field(default=None)
+    """
+    GPU index, which is the logic ID of the GPU chip,
+    which is a human-readable index and counted from 0 generally.
+    It might be recognized as the GPU device ID in some cases, when there is no more than one GPU chip on the same card.
+    """
+    device_index: Optional[int] = Field(default=0)
+    """
+    GPU device index, which is the index of the onboard GPU device.
+    In Linux, it can be retrieved under the /dev/ path.
+    For example, /dev/nvidia0 (the first Nvidia card), /dev/davinci2(the third Ascend card), etc.
+    """
+    device_chip_index: Optional[int] = Field(default=0)
+    """
+    GPU device chip index, which is the index of the GPU chip on the card.
+    It works with `device_index` to identify a GPU chip uniquely.
+    For example, the first chip on the first card is 0, and the second chip on the first card is 1.
+    """
+    arch_family: Optional[str] = Field(default=None)
+    """
+    Architecture family of the GPU device.
+    """
+    name: str = Field(default="")
+    """
+    GPU name, e.g. NVIDIA A100-SXM4-40GB, NVIDIA RTX 3090, AMD MI100, Ascend 310P, etc.
+    """
+    uuid: Optional[str] = Field(default="")
+    """
+    UUID is a unique identifier assigned to each GPU device.
+    """
+    driver_version: Optional[str] = Field(default=None)
+    """
+    Driver version of the GPU device, e.g. for NVIDIA GPUs.
+    """
+    runtime_version: Optional[str] = Field(default=None)
+    """
+    Runtime version of the GPU device, e.g. CUDA version for NVIDIA GPUs.
+    """
+    compute_capability: Optional[str] = Field(default=None)
+    """
+    Compute compatibility version of the GPU device, e.g. for NVIDIA GPUs.
+    """
 
 
-GPUDevicesInfo = List[GPUDeviceInfo]
+class GPUDeviceStatus(GPUDeviceInfo):
+    core: Optional[GPUCoreInfo] = Field(sa_column=Column(JSON), default=None)
+    """
+    Core information of the GPU device.
+    """
+    memory: Optional[MemoryInfo] = Field(sa_column=Column(JSON), default=None)
+    """
+    Memory information of the GPU device.
+    """
+    temperature: Optional[float] = Field(default=None)
+    """
+    Temperature of the GPU device in Celsius.
+    """
+    network: Optional[GPUNetworkInfo] = Field(sa_column=Column(JSON), default=None)
+    """
+    Network information of the GPU device, mainly for Ascend devices.
+    """
 
 
-class VendorEnum(str, Enum):
-    NVIDIA = "NVIDIA"
-    MTHREADS = "Moore Threads"
-    Apple = "Apple"
-    Huawei = "Huawei"
-    AMD = "AMD"
-    Hygon = "Hygon"
-    Iluvatar = "Iluvatar"
-    Cambricon = "Cambricon"
+GPUDevicesStatus = List[GPUDeviceStatus]
 
 
 class MountPoint(BaseModel):
@@ -126,9 +185,50 @@ class RPCServer(BaseModel):
 
 
 class WorkerStateEnum(str, Enum):
+    r"""
+    Enum for Worker State
+
+    State Transition Diagram:
+
+    Phase 1: Provisioning Controller          |  Phase 2: Healthcheck Controller
+    ------------------------------------------|------------------------------------
+    PENDING > PROVISIONING > INITIALIZING > READY < -----|----------->  UNREACHABLE
+                |             |         |      ^         |       (Worker Endpoint Unreachable)
+                |             |         |      |         |
+                |-------------|---------|------|         └----------->   NOT_READY
+                \_____________________________/|                 (Worker Stop Posting Status)
+                                   ERROR       | (Provisioning failed)       ^
+                                     |         |        |                    |
+                                     v         |        v                    |
+                                 DELETING  <---┘ (provisioning end)          |
+                                               |                             |
+                                               |                             |
+    Phase 3: Upgrade and Maintain              |                             |
+    -------------------------------------------|-----------------------------|-----
+                                               v                             |
+                                           MAINTENANCE <---------------------┘
+                                           (Back to Ready/Not Ready after maintenance completed)
+    """
+
     NOT_READY = "not_ready"
     READY = "ready"
     UNREACHABLE = "unreachable"
+    PENDING = "pending"
+    PROVISIONING = "provisioning"
+    INITIALIZING = "initializing"
+    DELETING = "deleting"
+    ERROR = "error"
+    MAINTENANCE = "maintenance"
+
+    @property
+    def is_provisioning(self) -> bool:
+        return self in [
+            WorkerStateEnum.PENDING,
+            WorkerStateEnum.PROVISIONING,
+            WorkerStateEnum.INITIALIZING,
+            WorkerStateEnum.DELETING,
+            WorkerStateEnum.ERROR,
+        ]
 
 
 class SystemInfo(BaseModel):
@@ -141,61 +241,138 @@ class SystemInfo(BaseModel):
     uptime: Optional[UptimeInfo] = Field(sa_column=Column(JSON), default=None)
 
 
+class Maintenance(BaseModel):
+    enabled: bool = False
+    message: Optional[str] = None
+
+
 class WorkerStatus(SystemInfo):
-    gpu_devices: Optional[GPUDevicesInfo] = Field(sa_column=Column(JSON), default=None)
+    """
+    rpc_servers: Deprecated
+    """
+
+    gpu_devices: Optional[GPUDevicesStatus] = Field(
+        sa_column=Column(JSON), default=None
+    )
     rpc_servers: Optional[Dict[int, RPCServer]] = Field(
         sa_column=Column(JSON), default=None
     )
 
     model_config = ConfigDict(from_attributes=True)
 
+    @classmethod
+    def get_default_status(cls) -> 'WorkerStatus':
+        return WorkerStatus(
+            cpu=CPUInfo(total=0),
+            memory=MemoryInfo(total=0, is_unified_memory=False),
+            swap=SwapInfo(total=0),
+            filesystem=[],
+            os=OperatingSystemInfo(name="", version=""),
+            kernel=KernelInfo(name="", release="", version="", architecture=""),
+            uptime=UptimeInfo(uptime=0, boot_time=""),
+            gpu_devices=[],
+        )
 
-class WorkerBase(SQLModel):
-    name: str = Field(index=True, unique=True)
+
+class WorkerStatusStored(BaseModel):
+    advertise_address: Optional[str] = None
     hostname: str
     ip: str
+    ifname: str
     port: int
-    labels: Dict[str, str] = Field(sa_column=Column(JSON), default={})
+    metrics_port: Optional[int] = None
 
     system_reserved: Optional[SystemReserved] = Field(
-        sa_column=Column(pydantic_column_type(SystemReserved))
+        default=None, sa_column=Column(pydantic_column_type(SystemReserved))
     )
-    state: WorkerStateEnum = WorkerStateEnum.NOT_READY
     state_message: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
     status: Optional[WorkerStatus] = Field(
         sa_column=Column(pydantic_column_type(WorkerStatus))
     )
-    unreachable: bool = False
+
+    worker_uuid: str = Field(sa_column=Column(String(255), nullable=False))
+    machine_id: Optional[str] = Field(
+        default=None
+    )  # The machine ID of the worker, used for identifying the worker in the cluster
+
+    proxy_mode: Optional[ModelInstanceProxyModeEnum] = Field(
+        default=ModelInstanceProxyModeEnum.WORKER,
+    )
+
+
+class WorkerStatusPublic(WorkerStatusStored):
+    gateway_endpoint: Optional[str] = None
+
+
+class WorkerUpdate(SQLModel):
+    """
+    WorkerUpdate: updatable fields for Worker
+    """
+
+    name: str = Field(index=True, unique=True)
+    labels: Dict[str, str] = Field(sa_column=Column(JSON), default={})
+    maintenance: Optional[Maintenance] = Field(
+        default=None,
+        sa_column=Column(pydantic_column_type(Maintenance), default=None),
+    )
+
+
+class WorkerCreate(WorkerStatusStored, WorkerUpdate):
+    cluster_id: Optional[int] = Field(
+        sa_column=Column(Integer, ForeignKey("clusters.id"), nullable=False),
+        default=None,
+    )
+    external_id: Optional[str] = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+
+
+class WorkerBase(WorkerCreate):
+    state: WorkerStateEnum = WorkerStateEnum.NOT_READY
     heartbeat_time: Optional[datetime] = Field(
         sa_column=Column(UTCDateTime), default=None
     )
-    worker_uuid: str
+    unreachable: bool = False
 
-    def compute_state(self, worker_offline_timeout=60):
+    def compute_state(self):
+        if self.maintenance and self.maintenance.enabled:
+            self.state = WorkerStateEnum.MAINTENANCE
+            self.state_message = self.maintenance.message
+            return
+
+        if self.state.is_provisioning:
+            return
         if self.state == WorkerStateEnum.NOT_READY and self.state_message is not None:
             return
-        now = int(datetime.now(timezone.utc).timestamp())
-        heartbeat_timestamp = (
-            self.heartbeat_time.timestamp() if self.heartbeat_time else None
+
+        is_not_ready_flag, last_heartbeat_str = is_offline(
+            self.heartbeat_time,
+            envs.WORKER_HEARTBEAT_GRACE_PERIOD,
+            datetime.now(timezone.utc),
         )
 
-        if (
-            heartbeat_timestamp is None
-            or now - heartbeat_timestamp > worker_offline_timeout
-        ):
+        if is_not_ready_flag:
+            reschedule_minutes = envs.MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD / 60
             self.state = WorkerStateEnum.NOT_READY
-            self.state_message = "Heartbeat lost, please <a href='https://docs.gpustack.ai/latest/troubleshooting/#view-gpustack-logs'>check the worker logs</a>. If everything proceeds smoothly, please verify that the clocks on both the worker and the server are properly synchronized."
+            self.state_message = (
+                f"Heartbeat lost (last heartbeat: {last_heartbeat_str}). "
+                f"If the worker remains unresponsive for more than {reschedule_minutes:.1f} minutes, "
+                "the instances on this worker will be rescheduled automatically. "
+                "If this downtime is planned maintenance, please enable maintenance mode. "
+                "Otherwise, please <a href='https://docs.gpustack.ai/latest/troubleshooting/#view-gpustack-logs'>check the worker logs</a>."
+            )
             return
 
         if self.unreachable:
-            healthz_url = f"http://{self.ip}:{self.port}/healthz"
+            address = self.advertise_address or self.ip
+            healthz_url = f"http://{address}:{self.port}/healthz"
             msg = (
                 "Server cannot access the "
                 f"worker's health check endpoint at {healthz_url}. "
                 "Please verify the port requirements in the "
-                "<a href='https://docs.gpustack.ai/latest/installation/installation-requirements/'>documentation</a>"
+                "<a href='https://docs.gpustack.ai/latest/installation/requirements/#port-requirements'>documentation</a>"
             )
             self.state = WorkerStateEnum.UNREACHABLE
             self.state_message = msg
@@ -204,10 +381,64 @@ class WorkerBase(SQLModel):
         self.state = WorkerStateEnum.READY
         self.state_message = None
 
+    provider: ClusterProvider = Field(default=ClusterProvider.Docker)
+    worker_pool_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(Integer, ForeignKey("worker_pools.id"), nullable=True),
+    )  # The worker pool this worker belongs to
+
+    # Not setting foreign key to manage lifecycle
+    ssh_key_id: Optional[int] = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    provider_config: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+
 
 class Worker(WorkerBase, BaseModelMixin, table=True):
     __tablename__ = 'workers'
     id: Optional[int] = Field(default=None, primary_key=True)
+
+    cluster: Cluster = Relationship(
+        back_populates="cluster_workers", sa_relationship_kwargs={"lazy": "noload"}
+    )
+    worker_pool: Optional[WorkerPool] = Relationship(
+        back_populates="pool_workers", sa_relationship_kwargs={"lazy": "noload"}
+    )
+
+    # This field should be replaced by x509 credential if mTLS is supported.
+    token: Optional[str] = Field(default=None, nullable=True)
+
+    @property
+    def provision_progress(self) -> Optional[str]:
+        """
+        The provisioning progress should have following steps:
+        1. create_ssh_key
+        2. create_instance with created ssh_key
+        3. wait_for_started
+        4. wait_for_public_ip
+        5. [optional] create_volumes_and_attach
+        """
+        if self.state == WorkerStateEnum.INITIALIZING:
+            return "5/5"
+        if (
+            self.state != WorkerStateEnum.PROVISIONING
+            and self.state != WorkerStateEnum.PENDING
+        ):
+            return None
+        format = "{}/{}"
+        total = 5
+        current = sum(
+            [
+                self.state == WorkerStateEnum.PROVISIONING,
+                self.ssh_key_id is not None,
+                self.external_id is not None,
+                self.ip is not None and self.ip != "",
+                "volume_ids" in (self.provider_config or {}),
+            ]
+        )
+        return format.format(current, total)
 
     def __hash__(self):
         return hash(self.id)
@@ -218,12 +449,17 @@ class Worker(WorkerBase, BaseModelMixin, table=True):
         return False
 
 
-class WorkerCreate(WorkerBase):
-    pass
-
-
-class WorkerUpdate(WorkerBase):
-    pass
+class WorkerListParams(ListParams):
+    sortable_fields: ClassVar[List[str]] = [
+        "name",
+        "state",
+        "ip",
+        "status.cpu.utilization_rate",
+        "status.memory.utilization_rate",
+        "gpus",  # gpu count, the same naming pattern as in Clusters
+        "created_at",
+        "updated_at",
+    ]
 
 
 class WorkerPublic(
@@ -232,6 +468,17 @@ class WorkerPublic(
     id: int
     created_at: datetime
     updated_at: datetime
+    me: Optional[bool] = None  # Indicates if the worker is the current worker
+    provision_progress: Optional[str] = None  # Indicates the provisioning progress
+
+    worker_uuid: Optional[str] = Field(default=None, exclude=True)
+    machine_id: Optional[str] = Field(default=None, exclude=True)
+
+
+class WorkerRegistrationPublic(WorkerPublic):
+    token: str
+    worker_uuid: str
+    worker_config: Optional["PredefinedConfigNoDefaults"] = None
 
 
 WorkersPublic = PaginatedList[WorkerPublic]

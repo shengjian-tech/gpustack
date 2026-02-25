@@ -3,6 +3,8 @@ from urllib.parse import urlparse
 import aiohttp
 from fastapi.responses import JSONResponse
 import logging
+from typing import Callable, Optional
+from functools import partial
 
 from fastapi import APIRouter, Request, Response
 
@@ -11,6 +13,7 @@ from gpustack.api.exceptions import (
     ForbiddenException,
 )
 from gpustack.config.config import get_global_config
+from gpustack.utils.network import use_proxy_env_for_url
 
 router = APIRouter()
 
@@ -25,6 +28,8 @@ ALLOWED_SITES = [
 
 HEADER_FORWARDED_PREFIX = "x-forwarded-"
 HEADER_SKIPPED = [
+    "date",
+    "set-cookie",
     "host",
     "port",
     "proto",
@@ -32,6 +37,7 @@ HEADER_SKIPPED = [
     "server",
     "content-length",
     "transfer-encoding",
+    "content-encoding",
     "cookie",
     "x-forwarded-host",
     "x-forwarded-port",
@@ -47,6 +53,15 @@ timeout = aiohttp.ClientTimeout(
 )
 
 
+def hf_token_process(url: str, headers: dict) -> dict:
+    global_config = get_global_config()
+    if global_config.huggingface_token and (
+        url.startswith("https://huggingface.co") or HF_ENDPOINT
+    ):
+        headers["Authorization"] = f"Bearer {global_config.huggingface_token}"
+    return headers
+
+
 @router.api_route("", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(request: Request, url: str):
 
@@ -54,9 +69,15 @@ async def proxy(request: Request, url: str):
     validate_url(url)
 
     url = replace_hf_endpoint(url)
+    return await proxy_to(request, url, header_func=partial(hf_token_process, url))
 
-    forwarded_headers = process_headers(request.headers, url)
 
+async def proxy_to(
+    request: Request, url: str, header_func: Optional[Callable[[dict], dict]] = None
+):
+    forwarded_headers = process_headers(request.headers)
+    if header_func is not None:
+        forwarded_headers = header_func(forwarded_headers)
     try:
         data = (
             await request.body()
@@ -64,7 +85,10 @@ async def proxy(request: Request, url: str):
             else None
         )
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        use_proxy_env = use_proxy_env_for_url(url)
+        async with aiohttp.ClientSession(
+            timeout=timeout, trust_env=use_proxy_env
+        ) as session:
             async with session.request(
                 method=request.method,
                 url=url,
@@ -72,7 +96,11 @@ async def proxy(request: Request, url: str):
                 data=data,
             ) as resp:
                 content = await resp.read()
-                headers = dict(resp.headers)
+                headers = {
+                    k: v
+                    for k, v in resp.headers.items()
+                    if k.lower() not in HEADER_SKIPPED
+                }
                 return Response(
                     status_code=resp.status,
                     content=content,
@@ -125,7 +153,7 @@ def replace_hf_endpoint(url: str) -> str:
     return url
 
 
-def process_headers(headers, url: str):
+def process_headers(headers: dict) -> dict:
     processed_headers = {}
     for key, value in headers.items():
         if key.lower() in HEADER_SKIPPED:
@@ -140,11 +168,5 @@ def process_headers(headers, url: str):
             processed_headers[key] = "identity"
         else:
             processed_headers[key] = value
-
-    global_config = get_global_config()
-    if global_config.huggingface_token and (
-        url.startswith("https://huggingface.co") or HF_ENDPOINT
-    ):
-        processed_headers["Authorization"] = f"Bearer {global_config.huggingface_token}"
 
     return processed_headers

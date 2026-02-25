@@ -9,9 +9,9 @@ source "${ROOT_DIR}/hack/lib/init.sh"
 
 function ci() {
   make install "$@"
+  make deps "$@"
   make lint "$@"
   make test "$@"
-  make validate "$@"
   make build "$@"
 }
 

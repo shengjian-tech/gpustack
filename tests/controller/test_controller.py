@@ -29,7 +29,7 @@ async def test_find_scale_down_candidates():
         linux_cpu_1(),
     ]
 
-    m = new_model(1, "test", 3, "llama3:70b")
+    m = new_model(1, "test", 3, "Meta-Llama-3-70B-Instruct-GGUF")
     mis = [
         new_model_instance(
             1,
@@ -78,14 +78,25 @@ async def test_find_scale_down_candidates():
     ]
 
     with (
-        patch('sqlmodel.ext.asyncio.session.AsyncSession', AsyncMock()),
         patch(
             'gpustack.schemas.models.ModelInstance.all_by_field',
             return_value=mis,
         ),
         patch(
+            'gpustack.schemas.models.ModelInstance.all',
+            return_value=mis,
+        ),
+        patch(
             'gpustack.schemas.workers.Worker.all',
             return_value=workers,
+        ),
+        patch(
+            'gpustack.policies.scorers.placement_scorer.async_session',
+            return_value=AsyncMock(),
+        ),
+        patch(
+            'gpustack.policies.scorers.status_scorer.async_session',
+            return_value=AsyncMock(),
         ),
     ):
 

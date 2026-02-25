@@ -74,7 +74,6 @@ def setup_logging(debug: bool = False):
         "httpx",
         "asyncio",
         "aiocache.base",
-        "aiosqlite",
         "urllib3.connectionpool",
         "multipart.multipart",
         "apscheduler.scheduler",
@@ -85,6 +84,9 @@ def setup_logging(debug: bool = False):
         "filelock",
         "fastapi-cdn-host",
         "huggingface_hub.file_download",
+        "docker.auth",
+        "kubernetes_asyncio.client.rest",
+        "azure.core.pipeline.policies.http_logging_policy",
     ]
 
     for logger_name in disable_logger_names:

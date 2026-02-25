@@ -23,7 +23,8 @@ from gpustack.schemas.models import Model, ModelInstance
 from gpustack.schemas.system_load import SystemLoad
 from gpustack.schemas.users import User
 from gpustack.server.deps import SessionDep
-from gpustack.schemas import Worker
+from gpustack.schemas import Worker, Cluster
+from gpustack.schemas.model_provider import ModelProvider
 from gpustack.server.system_load import compute_system_load
 
 router = APIRouter()
@@ -32,12 +33,14 @@ router = APIRouter()
 @router.get("")
 async def dashboard(
     session: SessionDep,
+    cluster_id: Optional[int] = None,
 ):
-    resoruce_counts = await get_resource_counts(session)
-    system_load = await get_system_load(session)
-    model_usage = await get_model_usage_summary(session)
-    active_models = await get_active_models(session)
+    resoruce_counts = await get_resource_counts(session, cluster_id)
+    system_load = await get_system_load(session, cluster_id)
+    model_usage = await get_model_usage_summary(session, cluster_id)
+    active_models = await get_active_models(session, cluster_id)
     summary = SystemSummary(
+        cluster_id=cluster_id,
         resource_counts=resoruce_counts,
         system_load=system_load,
         model_usage=model_usage,
@@ -47,15 +50,30 @@ async def dashboard(
     return summary
 
 
-async def get_resource_counts(session: AsyncSession) -> ResourceCounts:
-    workers = await Worker.all(session)
+async def get_resource_counts(
+    session: AsyncSession, cluster_id: Optional[int] = None
+) -> ResourceCounts:
+    fields = {}
+    cluster_count = None
+    if cluster_id is not None:
+        fields['cluster_id'] = cluster_id
+    else:
+        clusters = await Cluster.all_by_field(session, field="deleted_at", value=None)
+        cluster_count = len(clusters)
+    workers = await Worker.all_by_fields(
+        session,
+        fields=fields,
+    )
     worker_count = len(workers)
     gpu_count = 0
     for worker in workers:
         gpu_count += len(worker.status.gpu_devices or [])
-    model_count = await Model.count(session)
-    model_instance_count = await ModelInstance.count(session)
+    models = await Model.all_by_fields(session, fields=fields)
+    model_count = len(models)
+    model_instances = await ModelInstance.all_by_fields(session, fields=fields)
+    model_instance_count = len(model_instances)
     return ResourceCounts(
+        cluster_count=cluster_count,
         worker_count=worker_count,
         gpu_count=gpu_count,
         model_count=model_count,
@@ -63,15 +81,32 @@ async def get_resource_counts(session: AsyncSession) -> ResourceCounts:
     )
 
 
-async def get_system_load(session: AsyncSession) -> SystemLoadSummary:
-    workers = await Worker.all(session)
-    current_system_load = compute_system_load(workers)
+async def get_system_load(
+    session: AsyncSession, cluster_id: Optional[int] = None
+) -> SystemLoadSummary:
+    fields = {}
+    if cluster_id is not None:
+        fields['cluster_id'] = cluster_id
+    workers = await Worker.all_by_fields(session, fields=fields)
+    current_system_loads = compute_system_load(workers)
+    current_system_load = next(
+        (load for load in current_system_loads if load.cluster_id == cluster_id),
+        SystemLoad(
+            cluster_id=cluster_id,
+            cpu=0,
+            ram=0,
+            gpu=0,
+            vram=0,
+        ),
+    )
 
     now = datetime.now(timezone.utc)
 
     one_hour_ago = int((now - timedelta(hours=1)).timestamp())
 
-    statement = select(SystemLoad).where(SystemLoad.timestamp >= one_hour_ago)
+    statement = select(SystemLoad)
+    statement = statement.where(SystemLoad.cluster_id == cluster_id)
+    statement = statement.where(SystemLoad.timestamp >= one_hour_ago)
 
     system_loads = (await session.exec(statement)).all()
 
@@ -104,7 +139,10 @@ async def get_system_load(session: AsyncSession) -> SystemLoadSummary:
                 value=system_load.vram,
             )
         )
-
+    cpu.sort(key=lambda x: x.timestamp, reverse=False)
+    ram.sort(key=lambda x: x.timestamp, reverse=False)
+    gpu.sort(key=lambda x: x.timestamp, reverse=False)
+    vram.sort(key=lambda x: x.timestamp, reverse=False)
     return SystemLoadSummary(
         current=CurrentSystemLoad(
             cpu=current_system_load.cpu,
@@ -127,11 +165,14 @@ async def get_model_usage_stats(
     end_date: Optional[date] = None,
     model_ids: Optional[List[int]] = None,
     user_ids: Optional[List[int]] = None,
+    cluster_id: Optional[int] = None,
 ) -> ModelUsageStats:
     if start_date is None or end_date is None:
         end_date = date.today()
         start_date = end_date - timedelta(days=31)
-
+    if model_ids is None and cluster_id is not None:
+        models = await Model.all_by_fields(session, fields={"cluster_id": cluster_id})
+        model_ids = [model.id for model in models]
     statement = (
         select(
             ModelUsage.date,
@@ -191,8 +232,10 @@ async def get_model_usage_stats(
     )
 
 
-async def get_model_usage_summary(session: AsyncSession) -> ModelUsageSummary:
-    model_usage_stats = await get_model_usage_stats(session)
+async def get_model_usage_summary(
+    session: AsyncSession, cluster_id: Optional[int] = None
+) -> ModelUsageSummary:
+    model_usage_stats = await get_model_usage_stats(session, cluster_id=cluster_id)
     # get top users
     today = date.today()
     one_month_ago = today - timedelta(days=31)
@@ -237,8 +280,61 @@ async def get_model_usage_summary(session: AsyncSession) -> ModelUsageSummary:
     )
 
 
-async def get_active_models(session: AsyncSession) -> List[ModelSummary]:
-    statement = active_model_statement()
+async def _get_maas_active_models(session: AsyncSession) -> List[ModelSummary]:
+    all_providers = await ModelProvider.all_by_field(
+        session, field="deleted_at", value=None
+    )
+    if not all_providers:
+        return []
+
+    provider_ids = [p.id for p in all_providers]
+    total_tokens = func.sum(
+        ModelUsage.prompt_token_count + ModelUsage.completion_token_count
+    )
+    # Aggregate model usage in the database for efficiency
+    statement = (
+        select(
+            ModelUsage.provider_id,
+            ModelUsage.model_name,
+            total_tokens.label("total_token_count"),
+        )
+        .where(col(ModelUsage.provider_id).in_(provider_ids))
+        .group_by(ModelUsage.provider_id, ModelUsage.model_name)
+        .order_by(func.coalesce(total_tokens, 0).desc())
+        .limit(10)
+    )
+    top_model_usages = (await session.exec(statement)).all()
+
+    models_by_provider_and_name = {
+        (p.id, m.name): m for p in all_providers for m in (p.models or [])
+    }
+
+    provider_id_to_name = {p.id: p.name for p in all_providers}
+
+    model_summaries = []
+    for usage in top_model_usages:
+        model = models_by_provider_and_name.get((usage.provider_id, usage.model_name))
+
+        model_summaries.append(
+            ModelSummary(
+                provider_id=usage.provider_id,
+                provider_name=provider_id_to_name.get(
+                    usage.provider_id, "Unknown Provider"
+                ),
+                name=usage.model_name,
+                instance_count=0,
+                token_count=int(usage.total_token_count or 0),
+                categories=([model.category] if model and model.category else None),
+            )
+        )
+
+    return model_summaries
+
+
+async def _get_gpustack_active_models(
+    session: AsyncSession, cluster_id: Optional[int] = None
+) -> List[ModelSummary]:
+    statement = active_model_statement(cluster_id=cluster_id)
 
     results = (await session.exec(statement)).all()
 
@@ -285,6 +381,18 @@ async def get_active_models(session: AsyncSession) -> List[ModelSummary]:
     return model_summary
 
 
+async def get_active_models(
+    session: AsyncSession, cluster_id: Optional[int] = None
+) -> List[ModelSummary]:
+    summary = await _get_gpustack_active_models(session, cluster_id)
+    if cluster_id is None:
+        maas_active_models = await _get_maas_active_models(session)
+        summary.extend(maas_active_models)
+    summary.sort(key=lambda x: x.token_count, reverse=True)
+    summary = summary[:10]
+    return summary
+
+
 def aggregate_resource_claim(
     resource_claim: ResourceClaim,
     model_instance: ModelInstance,
@@ -305,7 +413,7 @@ def aggregate_resource_claim(
                     resource_claim.vram += vram
 
 
-def active_model_statement() -> select:
+def active_model_statement(cluster_id: Optional[int]) -> select:
     usage_sum_query = (
         select(
             Model.id.label('model_id'),
@@ -317,15 +425,18 @@ def active_model_statement() -> select:
         .group_by(Model.id)
     ).alias('usage_sum')
 
+    statement = select(
+        Model.id,
+        Model.name,
+        Model.categories,
+        func.count(distinct(ModelInstance.id)).label('instance_count'),
+        usage_sum_query.c.total_token_count,
+    )
+    if cluster_id is not None:
+        statement = statement.where(Model.cluster_id == cluster_id)
+
     statement = (
-        select(
-            Model.id,
-            Model.name,
-            Model.categories,
-            func.count(distinct(ModelInstance.id)).label('instance_count'),
-            usage_sum_query.c.total_token_count,
-        )
-        .join(ModelInstance, Model.id == ModelInstance.model_id)
+        statement.join(ModelInstance, Model.id == ModelInstance.model_id)
         .outerjoin(usage_sum_query, Model.id == usage_sum_query.c.model_id)
         .group_by(
             Model.id,

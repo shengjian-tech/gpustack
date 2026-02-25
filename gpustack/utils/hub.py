@@ -1,7 +1,9 @@
 import json
 import logging
+import gzip
 import os
-from typing import Dict, List, Optional
+import tempfile
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 import fnmatch
 from threading import Lock
@@ -9,18 +11,28 @@ from functools import cache
 from huggingface_hub import HfFileSystem
 from huggingface_hub.utils import validate_repo_id
 from modelscope.hub.api import HubApi
+from modelscope.hub.snapshot_download import (
+    snapshot_download as modelscope_snapshot_download,
+)
 from transformers import PretrainedConfig
 from huggingface_hub import HfApi
 from huggingface_hub.utils import GatedRepoError, HfHubHTTPError
 from requests.exceptions import HTTPError
 
 from gpustack.config.config import get_global_config
-from gpustack.schemas.models import Model, SourceEnum, get_mmproj_filename
+from gpustack.schemas import ModelFile
+from gpustack.schemas.models import (
+    CategoryEnum,
+    Model,
+    SourceEnum,
+    get_mmproj_filename,
+)
 from gpustack.utils.cache import is_cached, load_cache, save_cache
 
 logger = logging.getLogger(__name__)
 
 LIST_REPO_CACHE_DIR = "repo-skeleton"
+
 
 MODELSCOPE_CONFIG_ALLOW_FILE_PATTERN = [
     '*.json',
@@ -40,13 +52,11 @@ class FileEntry:
         self.size = size
 
 
-def get_model_path_and_name(model: Model) -> (str, str):
+def get_model_path_and_name(model: ModelFile) -> (str, str):
     if model.source == SourceEnum.HUGGING_FACE:
         return model.huggingface_repo_id, model.huggingface_filename
     elif model.source == SourceEnum.MODEL_SCOPE:
         return model.model_scope_model_id, model.model_scope_file_path
-    elif model.source == SourceEnum.OLLAMA_LIBRARY:
-        return model.ollama_library_model_name, ""
     elif model.source == SourceEnum.LOCAL_PATH:
         return model.local_path, ""
     else:
@@ -55,7 +65,7 @@ def get_model_path_and_name(model: Model) -> (str, str):
 
 def match_file_and_calculate_size(
     files: List[FileEntry],
-    model: Model,
+    model: ModelFile,
     cache_dir: str,
 ) -> (int, List[str]):
     """
@@ -71,9 +81,10 @@ def match_file_and_calculate_size(
     extra_filename = get_mmproj_filename(model)
 
     if file_path and not filename:
+        base_dir = model.local_dir or f"{cache_dir}/{model.source.value}/{file_path}"
         return (
             sum(f.size for f in files if getattr(f, 'size', None) is not None),
-            [f"{cache_dir}/{model.source.value}/{file_path}"],
+            [base_dir],
         )
 
     for sibling in files:
@@ -104,9 +115,8 @@ def match_file_and_calculate_size(
         SourceEnum.HUGGING_FACE,
         SourceEnum.MODEL_SCOPE,
     ]:
-        selected_files = [
-            f"{cache_dir}/{model.source.value}/{file_path}/{f}" for f in selected_files
-        ]
+        base_dir = model.local_dir or f"{cache_dir}/{model.source.value}/{file_path}"
+        selected_files = [os.path.join(base_dir, f) for f in selected_files]
 
     return sum_size, selected_files
 
@@ -170,8 +180,9 @@ def list_repo(
     source: str,
     token: Optional[str] = None,
     cache_expiration: Optional[int] = None,
+    root_dir_only: bool = False,
 ) -> List[Dict[str, any]]:
-    cache_key = f"{source}:{repo_id}"
+    cache_key = f"{source}:{repo_id}:{root_dir_only}"
     cached_result, is_succ = load_cache(
         LIST_REPO_CACHE_DIR, cache_key, cache_expiration
     )
@@ -184,23 +195,31 @@ def list_repo(
         validate_repo_id(repo_id)
         hffs = HfFileSystem(token=token)
         file_info = []
-        for file in hffs.ls(repo_id, recursive=True):
+        for file in hffs.ls(repo_id, recursive=not root_dir_only):
             if not isinstance(file, dict):
+                continue
+            relative_path = Path(file["name"]).relative_to(repo_id).as_posix()
+            # If root_only is True, skip files in subdirectories
+            if root_dir_only and "/" in relative_path:
                 continue
             file_info.append(
                 {
-                    "name": Path(file["name"]).relative_to(repo_id).as_posix(),
+                    "name": relative_path,
                     "size": file["size"],
                 }
             )
     elif source == SourceEnum.MODEL_SCOPE:
         msapi = HubApi()
-        files = msapi.get_model_files(repo_id, recursive=True)
+        files = msapi.get_model_files(repo_id, recursive=not root_dir_only)
         file_info = []
         for file in files:
+            file_path = file["Path"]
+            # If root_only is True, skip files in subdirectories
+            if root_dir_only and "/" in file_path:
+                continue
             file_info.append(
                 {
-                    "name": file["Path"],
+                    "name": file_path,
                     "size": file["Size"],
                 }
             )
@@ -250,10 +269,130 @@ def match_model_scope_file_paths(
     return matching_paths
 
 
+def read_repo_file_content(  # noqa: C901
+    model: Model,
+    file_path: str,
+    token: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Read a JSON config file from the model's source.
+
+    - Hugging Face: uses HfFileSystem to open `{repo_id}/{file_path}`.
+    - ModelScope: downloads a snapshot matching `file_path` and cleaned automatically after reading locally.
+    - Local Path: reads from the local directory only (no worker broadcast).
+
+    Returns None if the file cannot be found or read.
+    """
+    try:
+        if model.source == SourceEnum.HUGGING_FACE:
+            hffs = HfFileSystem(token=token)
+            repo_path = f"{model.huggingface_repo_id}/{file_path}"
+            with hffs.open(repo_path, "rb") as f:
+                content = f.read()
+                if (
+                    content
+                    and content.startswith(b"\x1f\x8b")
+                    and not file_path.endswith(".gz")
+                ):
+                    try:
+                        content = gzip.decompress(content)
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to decompress gzip content for {file_path}: {e}"
+                        )
+                return json.loads(content)
+
+        elif model.source == SourceEnum.MODEL_SCOPE:
+            _cfg = get_global_config()
+            base_tmp = os.path.join(
+                (_cfg.cache_dir if _cfg and _cfg.cache_dir else "/tmp"),
+                "modelscope",
+                "tempfile",
+            )
+            os.makedirs(base_tmp, exist_ok=True)
+            safe_id = (model.model_scope_model_id or "").replace("/", "__")
+            with tempfile.TemporaryDirectory(
+                dir=base_tmp, prefix=f"{safe_id}__"
+            ) as tmp_dir:
+                model_dir = modelscope_snapshot_download(
+                    model_id=model.model_scope_model_id,
+                    local_dir=tmp_dir,
+                    allow_patterns=[file_path],
+                )
+
+                candidate = os.path.join(model_dir, file_path)
+                fp = candidate if os.path.exists(candidate) else None
+                if not fp:
+                    # Search recursively by base filename for robustness
+                    base_name = os.path.basename(file_path)
+                    for root, _dirs, files in os.walk(model_dir):
+                        if base_name in files:
+                            fp = os.path.join(root, base_name)
+                            break
+                if not fp:
+                    return None
+                with open(fp, "r", encoding="utf-8") as f:
+                    return json.load(f)
+
+        elif model.source == SourceEnum.LOCAL_PATH:
+            local_path = model.local_path or ""
+            if not local_path or not os.path.isdir(local_path):
+                return None
+            fp = os.path.join(local_path, file_path)
+            if os.path.exists(fp):
+                with open(fp, "r", encoding="utf-8") as f:
+                    return json.load(f)
+
+            return None
+        else:
+            return None
+    except Exception as e:
+        source_key = (
+            model.huggingface_repo_id
+            or model.model_scope_model_id
+            or model.local_path
+            or "<unknown>"
+        )
+        logger.error(f"Failed to read '{file_path}' for source '{source_key}': {e}")
+        return None
+
+
 def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
     """
     Get the size of the model weights. This is the sum of all the weight files with extensions
-    .safetensors, .bin, .pt, .pth.
+    .safetensors, .bin, .pt, .pth in the root directory only.
+    Args:
+        model: Model to get the weight size for
+        token: Optional Hugging Face API token
+    Returns:
+        int: The size of the model weights
+    """
+    weight_file_extensions = (".safetensors", ".bin", ".pt", ".pth")
+    # consolidated.safetensors is usually a duplicate of other weight files. Exclude by default.
+    # Example: https://huggingface.co/mistralai/Voxtral-Small-24B-2507
+    exclude_files = ["consolidated.safetensors"]
+    if model.source == SourceEnum.HUGGING_FACE:
+        repo_id = model.huggingface_repo_id
+    elif model.source == SourceEnum.MODEL_SCOPE:
+        repo_id = model.model_scope_model_id
+    else:
+        raise ValueError(f"Unknown source {model.source}")
+    repo_file_infos = list_repo(repo_id, model.source, token=token, root_dir_only=True)
+    return sum(
+        file.get("size", 0)
+        for file in repo_file_infos
+        if (
+            file.get("name", "").endswith(weight_file_extensions)
+            and file.get("name", "") not in exclude_files
+        )
+    )
+
+
+def get_diffusion_model_weight_size(model: Model, token: Optional[str] = None) -> int:
+    """
+    Get the size of the diffusion model weights.
+    This is the sum of all weight files with extensions .safetensors, .bin, .pt, or .pth located in the root directory
+    and also specified in the model_index.
     Args:
         model: Model to get the weight size for
         token: Optional Hugging Face API token
@@ -267,12 +406,31 @@ def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
         repo_id = model.model_scope_model_id
     else:
         raise ValueError(f"Unknown source {model.source}")
-    repo_file_infos = list_repo(repo_id, model.source, token=token)
-    return sum(
-        file.get("size", 0)
-        for file in repo_file_infos
-        if file.get("name", "").endswith(weight_file_extensions)
-    )
+    if not model.categories or CategoryEnum.IMAGE not in model.categories:
+        raise ValueError("Model is not an image model")
+
+    # In different repositories, model files may be stored in different dir.
+    # However, during runtime, the diffusers loads components from corresponding dir according to the pipeline defined in model_index.json.
+    # We can follow the definition in model_index.json to determine which file weights should be included in the calculation.
+    pipeline_data = read_repo_file_content(model, "model_index.json", token=token)
+    if pipeline_data is None:
+        raise ValueError(f"No model_index.json in repo {repo_id}")
+    if isinstance(pipeline_data, list) and len(pipeline_data) > 0:
+        pipeline_data = pipeline_data[0]
+
+    sum_size = 0
+    repo_file_infos = list_repo(repo_id, model.source, token=token, root_dir_only=False)
+    for file_info in repo_file_infos:
+        name_split = file_info.get("name", "").split("/", 1)
+        if (
+            len(name_split) <= 1
+            or pipeline_data.get(name_split[0], None) is None
+            or not name_split[1].endswith(weight_file_extensions)
+        ):
+            continue
+        sum_size += file_info.get("size", 0)
+
+    return sum_size
 
 
 def get_pretrained_config(model: Model, **kwargs):
@@ -500,3 +658,56 @@ def get_model_scope_model_min_gguf_path(
                 return gguf_file
 
     return gguf_files[0]
+
+
+def has_diffusers_model_index(
+    model: Model,
+    token: Optional[str] = None,
+) -> bool:
+    """Check whether the model source contains a model_index.json with
+    the key "_diffusers_version".
+
+    This function only handles direct file access (Hub sources and local files).
+    For LOCAL_PATH models that require worker queries, use
+    check_diffusers_model_index_from_workers() in calculator.py instead.
+
+    Supported sources:
+    - Hugging Face: checks via HfFileSystem
+    - ModelScope: downloads only model_index.json via snapshot_download and inspects
+    - Local Path: reads model_index.json in the local directory only
+
+    Args:
+        model: Model to check
+        token: Optional Hugging Face API token
+
+    Returns:
+        True if model_index.json contains _diffusers_version, False otherwise
+    """
+    try:
+        data = read_repo_file_content(model, "model_index.json", token=token)
+        if data is None:
+            return False
+
+        # The typical structure is a dict containing _diffusers_version
+        if isinstance(data, dict) and "_diffusers_version" in data:
+            return True
+        # Some repos might have a list structure; check items for the key
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and "_diffusers_version" in item:
+                    return True
+
+        return False
+    except Exception as e:
+        # Best-effort detection; do not raise on error
+        try:
+            source_key = (
+                model.huggingface_repo_id
+                or model.model_scope_model_id
+                or model.local_path
+                or "<unknown>"
+            )
+            logger.error(f"Failed to check model_index.json for {source_key}: {e}")
+        except Exception:
+            pass
+        return False

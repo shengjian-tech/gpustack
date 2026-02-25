@@ -1,8 +1,9 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
-from gpustack.server.deps import ListParamsDep, SessionDep, EngineDep
+from gpustack.server.deps import SessionDep
 from gpustack.schemas.gpu_devices import (
     GPUDevice,
+    GPUDeviceListParams,
     GPUDevicesPublic,
     GPUDevicePublic,
 )
@@ -16,15 +17,20 @@ router = APIRouter()
 
 @router.get("", response_model=GPUDevicesPublic)
 async def get_gpus(
-    engine: EngineDep, session: SessionDep, params: ListParamsDep, search: str = None
+    session: SessionDep,
+    params: GPUDeviceListParams = Depends(),
+    search: str = None,
+    cluster_id: int = None,
 ):
     fuzzy_fields = {}
     if search:
         fuzzy_fields = {"name": search}
-
+    fields = {}
+    if cluster_id:
+        fields["cluster_id"] = cluster_id
     if params.watch:
         return StreamingResponse(
-            GPUDevice.streaming(engine, fuzzy_fields=fuzzy_fields),
+            GPUDevice.streaming(fuzzy_fields=fuzzy_fields, fields=fields),
             media_type="text/event-stream",
         )
 
@@ -33,6 +39,8 @@ async def get_gpus(
         fuzzy_fields=fuzzy_fields,
         page=params.page,
         per_page=params.perPage,
+        fields=fields,
+        order_by=params.order_by,
     )
 
 

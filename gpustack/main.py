@@ -2,11 +2,13 @@ import argparse
 from multiprocessing import freeze_support
 
 from gpustack.cmd import setup_start_cmd
-from gpustack.cmd.chat import setup_chat_cmd
+from gpustack.cmd.db_migration import setup_migrate_cmd
 from gpustack.cmd.download_tools import setup_download_tools_cmd
-from gpustack.cmd.draw import setup_draw_cmd
+from gpustack.cmd.images import setup_images_cmd
 from gpustack.cmd.reset_admin_password import setup_reset_admin_password_cmd
 from gpustack.cmd.version import setup_version_cmd
+from gpustack.cmd.reload_config import setup_reload_config_cmd
+from gpustack.cmd.prerun import setup_prerun_cmd
 
 
 def main():
@@ -19,19 +21,25 @@ def main():
         ),
     )
     subparsers = parser.add_subparsers(
-        help="sub-command help", metavar='{start,chat,download-tools,version}'
+        help="sub-command help",
+        metavar='{start,reload-config,list-images,save-images,copy-images,load-images,reset-admin-password,version}',
     )
 
     setup_start_cmd(subparsers)
-    setup_chat_cmd(subparsers)
-    setup_draw_cmd(subparsers)
+    setup_reload_config_cmd(subparsers)
     setup_download_tools_cmd(subparsers)
-    setup_version_cmd(subparsers)
+    setup_migrate_cmd(subparsers)
+    setup_images_cmd(subparsers)
+    setup_prerun_cmd(subparsers)
     setup_reset_admin_password_cmd(subparsers)
+    setup_version_cmd(subparsers)
 
     args = parser.parse_args()
     if hasattr(args, "func"):
-        args.func(args)
+        if isinstance(args.func, type):
+            args.func(args).run()
+        else:
+            args.func(args)
     else:
         parser.print_help()
 

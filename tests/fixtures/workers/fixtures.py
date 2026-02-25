@@ -3,7 +3,7 @@ import os
 from typing import Optional
 
 from gpustack.schemas.workers import (
-    GPUDeviceInfo,
+    GPUDeviceStatus,
     MemoryInfo,
     SystemReserved,
     Worker,
@@ -75,13 +75,13 @@ def macos_metal_3_m2ultra_192g(
     return worker
 
 
-def linux_huawei_1_910b_64gx8(
+def linux_ascend_1_910b_64gx8(
     reserved=False,
     return_device: Optional[int] = None,
     callback=None,
 ):
     """
-    Return a worker with 8 Huawei Ascend 910B devices, each with 64GB of memory.
+    Return a worker with 8 Ascend 910B devices, each with 64GB of memory.
     :param reserved: If True, the worker will have reserved system resources.
     :param return_device: The number of devices to return.
     :param callback: A callback function to be executed after loading the worker.
@@ -89,7 +89,7 @@ def linux_huawei_1_910b_64gx8(
     """
 
     worker = load_from_file(
-        "linux_huawei_1_910b_64gx8.json",
+        "linux_ascend_1_910b_64gx8.json",
         reserved=reserved,
         return_devices=return_device,
     )
@@ -98,13 +98,13 @@ def linux_huawei_1_910b_64gx8(
     return worker
 
 
-def linux_huawei_2_910b_64gx8(
+def linux_ascend_2_910b_64gx8(
     reserved=False,
     return_device: Optional[int] = None,
     callback=None,
 ):
     """
-    Return a worker with 8 Huawei Ascend 910B devices, each with 64GB of memory.
+    Return a worker with 8 Ascend 910B devices, each with 64GB of memory.
     :param reserved: If True, the worker will have reserved system resources.
     :param return_device:  The number of devices to return.
     :param callback: A callback function to be executed after loading the worker.
@@ -112,7 +112,7 @@ def linux_huawei_2_910b_64gx8(
     """
 
     worker = load_from_file(
-        "linux_huawei_2_910b_64gx8.json",
+        "linux_ascend_2_910b_64gx8.json",
         reserved=reserved,
         return_devices=return_device,
     )
@@ -121,13 +121,13 @@ def linux_huawei_2_910b_64gx8(
     return worker
 
 
-def linux_huawei_3_910b_64gx8(
+def linux_ascend_3_910b_64gx8(
     reserved=False,
     return_device: Optional[int] = None,
     callback=None,
 ):
     """
-    Return a worker with 8 Huawei Ascend 910B devices, each with 64GB of memory.
+    Return a worker with 8 Ascend 910B devices, each with 64GB of memory.
     :param reserved: If True, the worker will have reserved system resources.
     :param return_device: The number of devices to return.
     :param callback: A callback function to be executed after loading the worker.
@@ -135,7 +135,7 @@ def linux_huawei_3_910b_64gx8(
     """
 
     worker = load_from_file(
-        "linux_huawei_3_910b_64gx8.json",
+        "linux_ascend_3_910b_64gx8.json",
         reserved=reserved,
         return_devices=return_device,
     )
@@ -144,13 +144,13 @@ def linux_huawei_3_910b_64gx8(
     return worker
 
 
-def linux_huawei_4_910b_64gx8(
+def linux_ascend_4_910b_64gx8(
     reserved=False,
     return_device: Optional[int] = None,
     callback=None,
 ):
     """
-    Return a worker with 8 Huawei Ascend 910B devices, each with 64GB of memory.
+    Return a worker with 8 Ascend 910B devices, each with 64GB of memory.
     :param reserved: If True, the worker will have reserved system resources.
     :param return_device: The number of devices to return.
     :param callback: A callback function to be executed after loading the worker.
@@ -158,13 +158,17 @@ def linux_huawei_4_910b_64gx8(
     """
 
     worker = load_from_file(
-        "linux_huawei_4_910b_64gx8.json",
+        "linux_ascend_4_910b_64gx8.json",
         reserved=reserved,
         return_devices=return_device,
     )
     if callback:
         callback(worker)
     return worker
+
+
+def linux_nvidia_0_4090_24gx1(reserved=False):
+    return load_from_file("linux_nvidia_0_4090_24gx1.json", reserved=reserved)
 
 
 def linux_nvidia_1_4090_24gx1(reserved=False):
@@ -271,8 +275,16 @@ def linux_nvidia_25_H100_80gx8(reserved=False):
     return load_from_file("linux_nvidia_25_H100_80gx8.json", reserved=reserved)
 
 
+def linux_nvidia_26_H200_141gx8(reserved=False):
+    return load_from_file("linux_nvidia_26_H200_141gx8.json", reserved=reserved)
+
+
 def linux_rocm_1_7800_16gx1(reserved=True):
     return load_from_file("linux_rocm_1_7800_16gx1.json", reserved=reserved)
+
+
+def linux_rocm_2_7800_16gx2(reserved=True):
+    return load_from_file("linux_rocm_2_7800_16gx2.json", reserved=reserved)
 
 
 def linux_cpu_1(reserved=False):
@@ -285,6 +297,12 @@ def linux_cpu_2(reserved=False):
 
 def linux_cpu_3(reserved=False):
     return load_from_file("linux_cpu_3.json", reserved=reserved)
+
+
+def linux_mix_1_nvidia_4080_16gx1_rocm_7800_16gx1(reserved=False):
+    return load_from_file(
+        "linux_mix_1_nvidia_4080_16gx1_rocm_7800_16gx1.json", reserved=reserved
+    )
 
 
 def load_from_file(
@@ -302,7 +320,7 @@ def load_from_file(
         status.memory = MemoryInfo(**memory)
 
         if gpu_devices:
-            status.gpu_devices = [GPUDeviceInfo(**device) for device in gpu_devices]
+            status.gpu_devices = [GPUDeviceStatus(**device) for device in gpu_devices]
 
         worker = Worker(**dict)
         worker.status = status

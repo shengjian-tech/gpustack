@@ -1,305 +1,155 @@
-import asyncio
-import random
-from datetime import datetime, timezone
-import multiprocessing
 import os
 import logging
-from typing import Dict
+from typing import Optional, Tuple
 
-import psutil
-
-from gpustack.api.exceptions import AlreadyExistsException
 from gpustack.client import ClientSet
-from gpustack.config.config import Config
-from gpustack.detectors.custom.custom import Custom
-from gpustack.schemas.workers import (
-    SystemReserved,
-    Worker,
+from gpustack.client.worker_manager_clients import (
+    WorkerStatusClient,
+    WorkerRegistrationClient,
 )
-from gpustack.utils import network
+from gpustack.config.config import Config
+from gpustack.schemas.workers import (
+    WorkerCreate,
+    WorkerUpdate,
+    WorkerRegistrationPublic,
+)
+from gpustack.schemas.config import PredefinedConfigNoDefaults
+from gpustack.security import API_KEY_PREFIX
 from gpustack.utils import platform
-from gpustack.utils.process import terminate_process_tree
 from gpustack.worker.collector import WorkerStatusCollector
-from gpustack.worker.rpc_server import RPCServer, RPCServerProcessInfo
-from gpustack.detectors.detector_factory import DetectorFactory
-from gpustack.utils.profiling import time_decorator
+from gpustack.config.registration import (
+    registration_client,
+    read_worker_token,
+    write_worker_token,
+)
+from gpustack.utils.uuid import (
+    set_worker_name,
+    get_worker_name,
+    set_legacy_uuid,
+    get_legacy_uuid,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class WorkerManager:
+    _is_embedded: bool
+    _collector: WorkerStatusCollector
+    _clientset: Optional[ClientSet] = None
+    _registration_client: WorkerRegistrationClient
+    _status_client: WorkerStatusClient
+
     def __init__(
         self,
-        worker_ip: str,
-        worker_name: str,
-        system_reserved: SystemReserved,
-        clientset: ClientSet,
         cfg: Config,
-        worker_uuid: str,
+        is_embedded: bool,
+        collector: WorkerStatusCollector,
     ):
+        self._is_embedded = is_embedded
         self._cfg = cfg
-        self._registration_completed = False
-        self._worker_name = worker_name
-        self._worker_ip = worker_ip
-        self._worker_port = cfg.worker_port
-        self._clientset = clientset
-        self._system_reserved = system_reserved
-        self._rpc_servers: Dict[int, RPCServerProcessInfo] = {}
-        self._rpc_server_log_dir = f"{cfg.log_dir}/rpc_server"
-        self._rpc_server_cache_dir = f"{cfg.cache_dir}/rpc_server/"
-        self._rpc_server_args = cfg.rpc_server_args
-        self._gpu_devices = cfg.get_gpu_devices()
-        self._system_info = cfg.get_system_info()
-        self._worker_uuid = worker_uuid
+        self._collector = collector
+        worker_token = read_worker_token(self._cfg.data_dir)
+        if worker_token:
+            self._prepare_clients(worker_token)
 
-        self._worker_name_from_config = cfg.worker_name is not None
-
-        os.makedirs(self._rpc_server_log_dir, exist_ok=True)
+    def _prepare_clients(self, token: str):
+        self._clientset = ClientSet(
+            base_url=self._cfg.get_server_url(),
+            api_key=token,
+        )
+        self._status_client = WorkerStatusClient(self._clientset.http_client)
 
     def sync_worker_status(self):
         """
         Should be called periodically to sync the worker node status with the server.
         It registers the worker node with the server if necessary.
         """
-        collector = WorkerStatusCollector(
-            worker_ip=self._worker_ip,
-            worker_name=self._worker_name,
-            worker_port=self._worker_port,
-            clientset=self._clientset,
-            worker_manager=self,
-            gpu_devices=self._gpu_devices,
-            system_info=self._system_info,
-        )
-
+        if self._status_client is None:
+            return
         try:
-            worker = collector.collect()
-            result = self._clientset.workers.list(params={"name": self._worker_name})
+            workerStatus = self._collector.timed_collect(self._clientset)
         except Exception as e:
-            logger.error(f"Failed to update status for worker {self._worker_name}: {e}")
+            logger.error(f"Failed to collect status for worker: {e}")
             return
-
-        if result is None or len(result.items) == 0:
-            logger.error(f"Worker {self._worker_name} not found")
-            return
-
-        now = datetime.now(timezone.utc).replace(microsecond=0)
-
-        current = result.items[0]
-        worker.name = current.name
-        worker.id = current.id
-        worker.labels = current.labels
-        worker.unreachable = current.unreachable
-        worker.system_reserved = self._system_reserved
-        worker.heartbeat_time = now
-        ensure_builtin_labels(worker)
-
         try:
-            result = self._clientset.workers.update(id=current.id, model_update=worker)
+            self._status_client.create(workerStatus)
         except Exception as e:
-            logger.error(f"Failed to update worker {self._worker_name} status: {e}")
+            logger.error(f"Failed to update worker status: {e}")
 
-    def register_with_server(self):
-        if self._registration_completed:
-            return
-
-        worker = self._initialize_worker()
-        if worker is None:
-            return
-        self._register_worker(worker)
-        self._registration_completed = True
-
-    def _register_worker(self, worker: Worker):
-        logger.info(
-            f"Registering worker: {worker.name}",
-        )
-
-        same_worker, existing = self._check_same_worker()
-        update_name_file = False
-        if worker.name != self._worker_name:
-            worker.name = self._worker_name
-            update_name_file = True
-
+    def register_with_server(
+        self,
+    ) -> Tuple[ClientSet, Optional[PredefinedConfigNoDefaults]]:
+        # always re-register the worker and retrive the token and config
         try:
-            if existing:
-                # keep labels from the existing worker
-                worker.labels = same_worker.labels
-                self._clientset.workers.update(id=same_worker.id, model_update=worker)
-            else:
-                self._clientset.workers.create(worker)
+            worker_registerred = self._register_worker()
+            token = worker_registerred.token
+            write_worker_token(self._cfg.data_dir, token)
+            self._prepare_clients(token)
+            return self._clientset, worker_registerred.worker_config
         except Exception as e:
             logger.error(f"Failed to register worker: {e}")
             raise
 
-        if update_name_file:
-            # Modify files only after successful registration to avoid inconsistency problem
-            asyncio.create_task(self._update_local_worker_name_file())
-
-        logger.info(f"Worker {worker.name} registered.")
-
-    def _check_same_worker(self) -> tuple[Worker | None, bool]:
-        def _get_worker(params: dict) -> Worker | None:
-            result = self._clientset.workers.list(params=params)
-            return result.items[0] if result and result.items else None
-
-        def _generate_new_name() -> str:
-            new_name = f"{self._worker_name}-{random.randint(10000, 99999)}"
-            logger.info(
-                f"Worker name {self._worker_name} already exists, renaming to {new_name}"
-            )
-            return new_name
-
-        same_name_worker = _get_worker({"name": self._worker_name})
-        same_uuid_worker = _get_worker({"uuid": self._worker_uuid})
-
-        # Some old workers might not have a worker_uuid set.
-        if same_name_worker and not same_name_worker.worker_uuid and self._worker_uuid:
-            return same_name_worker, True
-
-        workers_match = (
-            same_uuid_worker
-            and same_name_worker
-            and same_uuid_worker.id == same_name_worker.id
+    def _register_worker(self) -> WorkerRegistrationPublic:
+        name = self._cfg.worker_name or get_worker_name(self._cfg.data_dir)
+        logger.info(
+            f"Registering worker with name: {name or '<auto-generated-name>'}",
         )
-        need_new_name = (
-            same_name_worker and same_name_worker.worker_uuid != self._worker_uuid
+        if self._is_embedded:
+            # always reloads the token
+            self._cfg.reload_token()
+        self._registration_client = registration_client(
+            data_dir=self._cfg.data_dir,
+            server_url=self._cfg.get_server_url(),
+            registration_token=self._cfg.token,
+            wait_token_file=self._is_embedded,
         )
+        external_id = None
+        external_id_path = os.path.join(self._cfg.data_dir, 'external_id')
+        if os.path.exists(external_id_path):
+            with open(os.path.join(self._cfg.data_dir, 'external_id'), 'r') as f:
+                external_id = f.read()
 
-        if not same_name_worker:
-            # no conflict with name, but check UUID
-            return same_uuid_worker, same_uuid_worker is not None
-        elif workers_match:
-            return same_uuid_worker, True
-        elif need_new_name:
-            if self._worker_name_from_config:
-                raise AlreadyExistsException(
-                    f"Worker '{self._worker_name}' already exists with a different UUID. Please use a different worker name."
-                )
-
-            self._worker_name = _generate_new_name()
-            return None, False
-
-        return None, False
-
-    async def _update_local_worker_name_file(self):
-        import aiofiles
-
-        worker_name_path = os.path.join(self._cfg.data_dir, "worker_name")
-        try:
-            async with aiofiles.open(worker_name_path, "w") as f:
-                await f.write(self._worker_name)
-        except Exception as e:
-            logger.error(f"Failed to update worker name file: {e}")
-
-    @time_decorator
-    def _initialize_worker(self):
-        try:
-            collector = WorkerStatusCollector(
-                worker_ip=self._worker_ip,
-                worker_name=self._worker_name,
-                worker_port=self._worker_port,
-                clientset=self._clientset,
-                worker_manager=self,
-                gpu_devices=self._gpu_devices,
-                system_info=self._system_info,
-            )
-            worker = collector.collect(initial=True)
-
-            worker.system_reserved = self._system_reserved
-            ensure_builtin_labels(worker)
-
-            return worker
-        except Exception as e:
-            logger.error(f"Failed to initialize worker: {e}")
-            raise e
+        workerStatus = self._collector.timed_collect(initial=True)
+        # Set empty name if not specified to avoid validation error
+        workerUpdate = WorkerUpdate(
+            name=name or "",
+            labels=self._ensure_builtin_labels(),
+        )
+        to_register = WorkerCreate.model_validate(
+            {
+                **workerStatus.model_dump(),
+                **workerUpdate.model_dump(),
+                "external_id": external_id,
+            }
+        )
+        created = self._registration_client.create(to_register)
+        logger.info(f"Worker {created.name} registered with worker_id {created.id}.")
+        set_worker_name(self._cfg.data_dir, created.name)
+        set_legacy_uuid(self._cfg.data_dir, created.worker_uuid)
+        return created
 
     def _register_shutdown_hooks(self):
         pass
 
-    def start_rpc_servers(self):
-        try:
-            self._start_rpc_servers()
-        except Exception as e:
-            logger.error(f"Failed to start rpc servers: {e}")
-            return
+    def _ensure_builtin_labels(self) -> dict:
+        labels = {
+            "os": platform.system(),
+            "arch": platform.arch(),
+        }
+        # worker name label will be set during registration
+        name = self._cfg.worker_name or get_worker_name(self._cfg.data_dir)
+        if name:
+            labels["worker-name"] = name
 
-    def _start_rpc_servers(self):
-        try:
-            detector_factory = (
-                DetectorFactory("custom", {"custom": [Custom(self._gpu_devices)]})
-                if self._gpu_devices
-                else DetectorFactory()
-            )
-            gpu_devices = detector_factory.detect_gpus()
-        except Exception as e:
-            logger.error(f"Failed to get GPU devices while start rpc servers: {e}")
-            return
+        # Legacy workers with version 0.7.x send worker_uuid as part of registration.
+        # Legacy workers with version <0.7.x don't have worker_uuid, so we use this label as part of the registration allowance.
+        is_legacy_token = self._cfg.token and not self._cfg.token.startswith(
+            API_KEY_PREFIX
+        )
+        is_legacy_worker = get_legacy_uuid(self._cfg.data_dir) is None
+        is_existing_worker = get_worker_name(self._cfg.data_dir) is not None
 
-        for gpu_device in gpu_devices:
-            if gpu_device.index is None:
-                logger.warning(
-                    f"GPU device {gpu_device.name} does not have an index. Skipping start rpc server."
-                )
-                continue
-
-            current = self._rpc_servers.get(gpu_device.index)
-            if current:
-                if current.process.is_alive():
-                    continue
-
-                pid = current.process.pid
-                logger.warning(
-                    f"RPC server for GPU {gpu_device.index} is not running, pid {pid}, restarting."
-                )
-                try:
-                    terminate_process_tree(pid)
-                except psutil.NoSuchProcess:
-                    pass
-                except Exception as e:
-                    logger.error(f"Failed to terminate process {pid}: {e}")
-                self._rpc_servers.pop(gpu_device.index)
-
-            log_file_path = f"{self._rpc_server_log_dir}/gpu-{gpu_device.index}.log"
-            port = network.get_free_port(
-                port_range=self._cfg.rpc_server_port_range,
-                unavailable_ports=self.get_occupied_ports(),
-            )
-            process = multiprocessing.Process(
-                target=RPCServer.start,
-                args=(
-                    port,
-                    gpu_device.index,
-                    gpu_device.vendor,
-                    log_file_path,
-                    self._rpc_server_cache_dir,
-                    self._cfg.bin_dir,
-                    self._rpc_server_args,
-                ),
-            )
-
-            process.daemon = True
-            process.start()
-
-            self._rpc_servers[gpu_device.index] = RPCServerProcessInfo(
-                process=process, port=port, gpu_index=gpu_device.index
-            )
-            logger.info(
-                f"Started RPC server for GPU {gpu_device.index} on port {port}, pid {process.pid}"
-            )
-
-    def get_rpc_servers(self) -> Dict[int, RPCServerProcessInfo]:
-        return self._rpc_servers
-
-    def get_occupied_ports(self) -> set[int]:
-        return {server.port for server in self._rpc_servers.values()}
-
-    def get_worker_uuid(self) -> str:
-        return self._worker_uuid
-
-
-def ensure_builtin_labels(worker: Worker):
-    if worker.labels is None:
-        worker.labels = {}
-
-    worker.labels.setdefault("os", platform.system())
-    worker.labels.setdefault("arch", platform.arch())
-    worker.labels.setdefault("worker-name", worker.name)
+        if (is_legacy_token or is_legacy_worker) and is_existing_worker:
+            labels["gpustack.existence-check"] = "true"
+        return labels

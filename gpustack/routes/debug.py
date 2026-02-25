@@ -1,7 +1,11 @@
 import logging
+import tracemalloc
 from fastapi import APIRouter, Request
 
-from gpustack.api.exceptions import InvalidException
+from gpustack.api.exceptions import (
+    BadRequestException,
+    InvalidException,
+)
 
 router = APIRouter()
 
@@ -25,3 +29,16 @@ async def set_log_level(request: Request):
     logging.getLogger().setLevel(numeric_level)
     logger.info(f"Set log level to {level_str}")
     return "ok"
+
+
+@router.get("/memory")
+def get_memory_profile():
+    if not tracemalloc.is_tracing():
+        raise BadRequestException(
+            message="tracemalloc is not enabled. Please run GPUStack server in debug mode."
+        )
+
+    snapshot = tracemalloc.take_snapshot()
+    top_stats = snapshot.statistics('lineno')
+    result = [str(stat) for stat in top_stats[:20]]
+    return {"top_memory_lines": result}

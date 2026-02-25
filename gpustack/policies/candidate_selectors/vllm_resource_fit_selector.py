@@ -1,136 +1,44 @@
-import asyncio
-import math
+import json
 from collections import defaultdict
 import logging
-import os
 import re
-from functools import reduce
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from gpustack.policies.base import (
     Allocatable,
     ModelInstanceScheduleCandidate,
+)
+from gpustack.policies.candidate_selectors.base_candidate_selector import (
+    EVENT_ACTION_AUTO_MULTI_WORKER_MULTI_GPU,
+    EVENT_ACTION_AUTO_SINGLE_GPU,
+    EVENT_ACTION_AUTO_SINGLE_WORKER_MULTI_GPU,
+    EVENT_ACTION_DEFAULT,
+    EVENT_ACTION_MANUAL_MULTI,
+    RequestEstimateUsage,
     ScheduleCandidatesSelector,
 )
 from gpustack.policies.event_recorder.recorder import EventCollector, EventLevelEnum
 from gpustack.policies.utils import (
-    get_worker_allocatable_resource,
-    get_worker_model_instances,
     ListMessageBuilder,
+    estimate_model_vram,
+    group_workers_by_gpu_type,
+    ram_not_enough,
+    get_model_ram_claim,
+    get_computed_ram_claim,
+    sort_workers_by_gpu_count,
 )
 from gpustack.schemas.models import (
     CategoryEnum,
     ComputedResourceClaim,
     Model,
+    ModelInstance,
     ModelInstanceSubordinateWorker,
-    SourceEnum,
 )
-from gpustack.schemas.workers import GPUDevicesInfo, Worker
+from gpustack.schemas.workers import GPUDevicesStatus, Worker
 from gpustack.config import Config
-from gpustack.server.db import get_engine
-from gpustack.utils.command import find_parameter
-from gpustack.utils.convert import safe_int
-from gpustack.utils.gpu import parse_gpu_id, parse_gpu_ids_by_worker
-from gpustack.utils.hub import get_model_weight_size, get_pretrained_config
+from gpustack.utils.command import find_parameter, find_int_parameter
 from gpustack.utils.unit import byte_to_gib
 
 logger = logging.getLogger(__name__)
-
-EVENT_ACTION_DEFAULT = "default_scheduling_msg"
-EVENT_ACTION_MANUAL_MULTI = "manual_multi_gpu_scheduling_msg"
-EVENT_ACTION_AUTO_MULTI_WORKER_MULTI_GPU = "auto_multi_worker_multi_gpu_scheduling_msg"
-EVENT_ACTION_AUTO_SINGLE_WORKER_MULTI_GPU = (
-    "auto_single_worker_multi_gpu_scheduling_msg"
-)
-EVENT_ACTION_AUTO_SINGLE_GPU = "auto_single_gpu_scheduling_msg"
-
-
-async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
-    """
-    Estimate the vram requirement in bytes heuristically.
-    This is the minimum requirement to help us decide how many GPUs are needed for the model.
-    If users explicitly set parameters like tp & pp, this estimation is not needed.
-
-    Formula:
-
-        VRAM = WEIGHT * 1.2 + RESERVERD_FOOTPRINT
-
-    Reference for the 20% overhead: https://blog.eleuther.ai/transformer-math/#total-inference-memory
-
-    For example, using bfloat16,
-    - 0.5B requires 3.1 GiB
-    - 3B requires 8.9 GiB
-    - 7B requires 19.0 GiB
-    - 72B requires 164.5 GiB
-
-    """
-    if model.env and 'GPUSTACK_MODEL_VRAM_CLAIM' in model.env:
-        # Use as a potential workaround if the empirical vram estimation is far beyond the expected value.
-        return int(model.env['GPUSTACK_MODEL_VRAM_CLAIM'])
-
-    # CUDA graphs can take additional 1~3 GiB memory
-    # https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/worker/model_runner.py#L1313
-    # For non-LLM models like embedding, set a smaller overhead
-    framework_overhead = (
-        2 * 1024**3
-        if not model.categories or CategoryEnum.LLM in model.categories
-        else 512 * 1024**2
-    )
-    weight_size = 0
-    timeout_in_seconds = 15
-
-    try:
-        if (
-            model.source == SourceEnum.HUGGING_FACE
-            or model.source == SourceEnum.MODEL_SCOPE
-        ):
-            weight_size = await asyncio.wait_for(
-                asyncio.to_thread(get_model_weight_size, model, token),
-                timeout=timeout_in_seconds,
-            )
-        elif model.source == SourceEnum.LOCAL_PATH and os.path.exists(model.local_path):
-            weight_size = get_local_model_weight_size(model.local_path)
-    except asyncio.TimeoutError:
-        logger.warning(f"Timeout when getting weight size for model {model.name}")
-    except Exception as e:
-        logger.warning(f"Cannot get weight size for model {model.name}: {e}")
-
-    # Reference: https://blog.eleuther.ai/transformer-math/#total-inference-memory
-    return weight_size * 1.2 + framework_overhead
-
-
-def get_model_num_attention_heads(pretrained_config) -> Optional[int]:
-    """
-    Get the number of attention heads in the model.
-    """
-
-    num_attention_heads = None
-    try:
-        num_attention_heads_set = set()
-
-        # Helper to collect num_attention_heads from configs
-        def add_heads_from(cfg, key="num_attention_heads"):
-            value = getattr(cfg, key, None)
-            if isinstance(value, int) and value > 0:
-                num_attention_heads_set.add(value)
-
-        for _config in [
-            pretrained_config,
-            getattr(pretrained_config, "llm_config", None),
-            getattr(pretrained_config, "text_config", None),
-            getattr(pretrained_config, "vision_config", None),
-        ]:
-            if _config:
-                add_heads_from(_config)
-
-        if not num_attention_heads_set:
-            return None
-
-        num_attention_heads = reduce(math.gcd, num_attention_heads_set)
-
-    except Exception as e:
-        logger.warning(f"Cannot get num_attention_heads: {e}")
-
-    return num_attention_heads
 
 
 def parse_model_size_by_name(model_name: str) -> int:
@@ -145,95 +53,75 @@ def parse_model_size_by_name(model_name: str) -> int:
         raise ValueError(f"Cannot parse model size from model name: {model_name}")
 
 
-def get_local_model_weight_size(local_path: str) -> int:
-    """
-    Get the local model weight size in bytes. Estimate by the total size of files in the top-level (depth 1) of the directory.
-    """
-    total_size = 0
-
-    try:
-        with os.scandir(local_path) as entries:
-            for entry in entries:
-                if entry.is_file():
-                    total_size += entry.stat().st_size
-    except FileNotFoundError:
-        raise FileNotFoundError(f"The specified path '{local_path}' does not exist.")
-    except NotADirectoryError:
-        raise NotADirectoryError(
-            f"The specified path '{local_path}' is not a directory."
-        )
-    except PermissionError:
-        raise PermissionError(f"Permission denied when accessing '{local_path}'.")
-
-    return total_size
-
-
 class VLLMResourceFitSelector(ScheduleCandidatesSelector):
     def __init__(
         self,
         cfg: Config,
         model: Model,
+        model_instances: List[ModelInstance],
     ):
-        self._engine = get_engine()
-        self._cfg = cfg
-        self._model = model
-        self._gpu_count = None
+        super().__init__(cfg, model, model_instances)
+
         self._vram_claim = 0
+        self._ram_claim = 0
         self._largest_single_gpu_vram = 0
         self._largest_single_gpu_vram_utilization = 0
         self._largest_multi_gpu_vram = 0
         self._largest_multi_gpu_total = 0
         self._largest_multi_gpu_utilization_satisfied_count = 0
 
-        self._num_attention_heads = None
         self._messages = []
         self._event_collector = EventCollector(self._model, logger)
         self._workers_allocatable_resource: Dict[int, Allocatable] = {}
+        self._worker_name_to_vram: Dict[str, Dict[int, int]] = {}
 
-        self._selected_gpu_workers: List[str] = None
-        self._selected_gpu_worker_count = 0
-        self._selected_gpu_indexes_by_worker: Dict[str, List[int]] = {}
         self._unsatisfied_gpu_messages: Dict[str, List[int]] = {}
 
-        if self._model.gpu_selector and self._model.gpu_selector.gpu_ids:
-            gpu_ids_by_worker = parse_gpu_ids_by_worker(
-                self._model.gpu_selector.gpu_ids
-            )
-            self._selected_gpu_workers = list(gpu_ids_by_worker.keys())
-            self._selected_gpu_worker_count = len(self._selected_gpu_workers)
-            for worker_name, gpu_ids in gpu_ids_by_worker.items():
-                gpu_indexes = []
-                for gpu_id in gpu_ids:
-                    valid, matched = parse_gpu_id(gpu_id)
-                    if valid:
-                        gpu_index = safe_int(matched.get("gpu_index"))
-                        gpu_indexes.append(gpu_index)
-                self._selected_gpu_indexes_by_worker[worker_name] = gpu_indexes
+        world_size, strategies = (
+            VLLMResourceFitSelector.get_world_size_from_backend_parameters(model)
+        )
+        self._set_gpu_count(world_size, strategies)
 
-            # When user defined gpu selector, we use the gpu count from it.
-            self._gpu_count = len(self._model.gpu_selector.gpu_ids)
-
-        # When tp/pp is set, the gpu count is calculated by tp * pp.
-        # Pick the candidate with satisfied gpu count.
-        # Otherwise, estimate gpu count by vram requirement heuristically.
-        tp = find_parameter(model.backend_parameters, ["tensor-parallel-size", "tp"])
-        pp = find_parameter(model.backend_parameters, ["pipeline-parallel-size", "pp"])
-        if tp or pp:
-            world_size = int(tp or 1) * int(pp or 1)
-
-            if self._gpu_count and self._gpu_count != world_size:
-                # Both gpu selector and tp/pp are set, validate they match.
-                raise ValueError(
-                    f"Model {model.name} has -tp/-pp set, but the selected gpu count ({self._gpu_count}) does not match the world size ({world_size})."
-                )
-            else:
-                self._gpu_count = world_size
-                self._vram_claim = 0
-
-        self._set_pretrained_config()
-        # _pretrained_config may be None or an empty dictionary, but subsequent methods are designed to handle this case.
+    async def _init_model_parameters(self, workers: List[Worker]):
+        await super()._init_model_parameters(workers)
+        self._validate_arguments()
+        # GMU relies on architecture info in model parameters. Set it after model parameters are initialized.
         self._set_gpu_memory_utilization()
-        self._set_num_attention_heads()
+
+    @staticmethod
+    def get_world_size_from_backend_parameters(
+        model: Model,
+    ) -> Tuple[Optional[int], Optional[List[str]]]:
+        tp = find_int_parameter(
+            model.backend_parameters, ["tensor-parallel-size", "tp"]
+        )
+        pp = find_int_parameter(
+            model.backend_parameters, ["pipeline-parallel-size", "pp"]
+        )
+        dp = find_int_parameter(model.backend_parameters, ["data-parallel-size", "dp"])
+        dpl = find_int_parameter(
+            model.backend_parameters, ["--data-parallel-size-local", "dpl"]
+        )
+
+        if tp or pp or dp:
+            world_size = 1
+            strategies = []
+            if tp:
+                strategies.append("tp")
+                world_size *= tp
+            if pp:
+                strategies.append("pp")
+                world_size *= pp
+            if dp:
+                strategies.append("dp")
+                world_size *= dp
+                if dpl:
+                    # NB(thxCode): Indicate how many DP groups(each group owns `-dp` number devices) are there in one worker.
+                    world_size *= dpl
+
+            return world_size, strategies
+
+        return None, None
 
     def _set_gpu_memory_utilization(self):
         self._gpu_memory_utilization = 0.9
@@ -261,44 +149,34 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         if not self._model.categories:
             return False
 
-        architectures = getattr(self._pretrained_config, "architectures", []) or []
+        architectures = self._model_params.architectures or []
 
         # Non-LLM models that vLLM still uses GPU memory utilization
         NON_LLM_GMU_EXCEPTIONS = {
             "Qwen3ForCausalLM",
             "Qwen3ForSequenceClassification",  # Qwen3-Embedding & Qwen3-Reranker
+            "Qwen3VLForConditionalGeneration",  # Qwen3-VL-Embedding & Qwen3-VL-Reranker
         }
 
-        if CategoryEnum.LLM not in self._model.categories:
-            # Disable for non-LLM models unless they are in the exception list
-            return not any(arch in NON_LLM_GMU_EXCEPTIONS for arch in architectures)
+        use_gmu_categories = [CategoryEnum.LLM, CategoryEnum.SPEECH_TO_TEXT]
+        if any(cat in self._model.categories for cat in use_gmu_categories):
+            return False
 
-        return False
+        # Disable for non-LLM models unless they are in the exception list
+        return not any(arch in NON_LLM_GMU_EXCEPTIONS for arch in architectures)
 
-    def _set_pretrained_config(self):
-        try:
-            self._pretrained_config = get_pretrained_config(
-                self._model, trust_remote_code=True
-            )
-        except Exception as e:
-            raise Exception(
-                f"Cannot get pretrained config for model {self._model.readable_source}: {e}"
-            ) from e
+    def _set_model_parameters(self):
+        super()._set_model_parameters()
 
-    def _set_num_attention_heads(self):
-        self._num_attention_heads = get_model_num_attention_heads(
-            self._pretrained_config
-        )
-        if (
-            self._gpu_count
-            and self._num_attention_heads
-            and self._num_attention_heads % self._gpu_count != 0
-        ):
-            raise ValueError(
-                f"Total number of attention heads ({self._num_attention_heads})"
-                " must be divisible by gpu count "
-                f"({self._gpu_count})."
-            )
+        # Get the architectures from hf-overrides. This helps make resource allocation
+        # decisions for specific models like Qwen3-Embedding and Qwen3-Reranker.
+        hf_overrides = find_parameter(self._model.backend_parameters, ["hf-overrides"])
+        if hf_overrides:
+            overrides_dict = json.loads(hf_overrides)
+            if isinstance(overrides_dict, dict) and "architectures" in overrides_dict:
+                self._model_params.architectures = overrides_dict["architectures"]
+
+        self._num_attention_heads = self._model_params.num_attention_heads
 
     def _cal_effective_vram(self) -> float:
         if self._largest_multi_gpu_total == 0:
@@ -344,13 +222,20 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
     def get_messages(self) -> List[str]:
         return self._messages
 
-    async def _get_worker_allocatable_resource(self, worker: Worker):
-        if worker.id in self._workers_allocatable_resource:
-            return self._workers_allocatable_resource[worker.id]
+    def _get_worker_vram(self, worker: Worker) -> Dict[int, int]:
+        if worker.name in self._worker_name_to_vram:
+            return self._worker_name_to_vram[worker.name]
 
-        allocatable = await get_worker_allocatable_resource(self._engine, worker)
-        self._workers_allocatable_resource[worker.id] = allocatable
-        return allocatable
+        if worker.status is None or not worker.status.gpu_devices:
+            return {}
+
+        vram_total_by_index = {}
+        for gpu in worker.status.gpu_devices:
+            total = gpu.memory.total if gpu.memory else 0
+            vram_total_by_index[gpu.index] = total
+
+        self._worker_name_to_vram[worker.name] = vram_total_by_index
+        return vram_total_by_index
 
     async def select_candidates(
         self, workers: List[Worker]
@@ -359,16 +244,21 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         Get schedule candidates that fit the GPU resources requirement.
         """
 
+        # Initialize model parameters.
+        await self._init_model_parameters(workers)
+
         self._vram_claim = await estimate_model_vram(
-            self._model, self._cfg.huggingface_token
+            self._model, self._config.huggingface_token, workers
         )
+        self._ram_claim = get_model_ram_claim(self._model)
         logger.info(
             f"Calculated resource claim for model {self._model.readable_source}, "
-            f"claim: {self._vram_claim}"
+            f"VRAM claim: {self._vram_claim}, RAM claim: {self._ram_claim}"
         )
 
         default_msg_list = ListMessageBuilder(
-            f"The model requires approximately {byte_to_gib(self._vram_claim)} GiB of VRAM."
+            f"The model requires approximately {byte_to_gib(self._vram_claim)} GiB of VRAM"
+            f"{f' and {byte_to_gib(self._ram_claim)} GiB of RAM' if self._ram_claim > 0 else ''}."
         )
         if self._gpu_memory_utilization != 0:
             default_msg_list.append(
@@ -383,19 +273,23 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         )
 
         candidate_functions = [
+            self.find_manual_gpu_selection_candidates,
             self.find_single_worker_single_gpu_full_offloading_candidates,
             self.find_single_worker_multi_gpu_full_offloading_candidates,
             self.find_multi_worker_multi_gpu_candidates,
         ]
 
         for candidate_func in candidate_functions:
+            if self.should_skip_candidate_func(candidate_func):
+                continue
+
             logger.debug(
                 f"model {self._model.readable_source}, filter candidates with resource fit selector: {candidate_func.__name__}"
             )
 
-            candidates = await candidate_func(workers)
+            candidates = candidate_func(workers)
 
-            if len(candidates) == 1 and candidates[0].overcommit:
+            if len(candidates) >= 1 and candidates[0].overcommit:
                 # Manually selected candidate with overcommit. Also add the message.
                 # It's useful for compatibility check.
                 self._set_messages()
@@ -406,7 +300,39 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         self._set_messages()
         return []
 
-    async def find_single_worker_single_gpu_full_offloading_candidates(
+    def should_skip_candidate_func(self, candidate_func) -> bool:
+        # Skip conditions for manual GPU selection.
+        if (
+            self._selected_gpu_workers
+            and candidate_func != self.find_manual_gpu_selection_candidates
+        ):
+            return True
+
+        # Skip conditions for distributed inference.
+        if (
+            not self._model.distributed_inference_across_workers
+            and candidate_func == self.find_multi_worker_multi_gpu_candidates
+        ):
+            return True
+
+        return False
+
+    def find_manual_gpu_selection_candidates(
+        self, workers: List[Worker]
+    ) -> List[ModelInstanceScheduleCandidate]:
+        request = RequestEstimateUsage(
+            ram=self._ram_claim,
+            vram=self._vram_claim,
+        )
+
+        return self._find_manual_gpu_selection_candidates(
+            workers,
+            {"*": self._gpu_memory_utilization},
+            request,
+            self._event_collector,
+        )
+
+    def find_single_worker_single_gpu_full_offloading_candidates(
         self, workers: List[Worker]
     ) -> List[ModelInstanceScheduleCandidate]:
         """
@@ -416,42 +342,26 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             # Skip multi-GPU selection
             return []
 
-        if self._selected_gpu_worker_count > 1:
-            # Skip multi-worker selection
-            return []
-
-        selected_gpu_worker = None
-        selected_gpu_index = None
-        if self._selected_gpu_workers:
-            # Handle manual scheduling
-            selected_gpu_worker = self._selected_gpu_workers[0]
-            selected_gpu_indexes = self._selected_gpu_indexes_by_worker[
-                selected_gpu_worker
-            ]
-            selected_gpu_index = (
-                selected_gpu_indexes[0] if selected_gpu_indexes else None
-            )
-
         candidates = []
-        for worker in workers:
-            if not worker.status.gpu_devices:
-                continue
+        workers_of_type = group_workers_by_gpu_type(workers)
+        for gpu_type, workers_of_type in workers_of_type.items():
+            for worker in workers_of_type:
+                if not worker.status.gpu_devices:
+                    continue
 
-            if selected_gpu_worker and worker.name != selected_gpu_worker:
-                continue
-
-            result = (
-                await self._find_single_worker_single_gpu_full_offloading_candidates(
-                    worker, selected_gpu_index
+                result = self._find_single_worker_single_gpu_full_offloading_candidates(
+                    worker,
+                    gpu_type,
                 )
-            )
-            if result:
-                candidates.extend(result)
+                if result:
+                    candidates.extend(result)
 
         return candidates
 
-    async def _find_single_worker_single_gpu_full_offloading_candidates(
-        self, worker: Worker, selected_gpu_index: Optional[int]
+    def _find_single_worker_single_gpu_full_offloading_candidates(
+        self,
+        worker: Worker,
+        gpu_type: Optional[str] = None,
     ) -> List[ModelInstanceScheduleCandidate]:
         """
         Find single worker single gpu full offloading candidates for the model instance with worker.
@@ -460,15 +370,15 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
 
         candidates = []
 
-        allocatable = await self._get_worker_allocatable_resource(worker)
+        allocatable = self.get_worker_allocatable_resource(worker, gpu_type)
+
+        if ram_not_enough(self._ram_claim, allocatable):
+            return []
 
         if not worker.status.gpu_devices:
             return []
 
         for _, gpu in enumerate(worker.status.gpu_devices):
-
-            if selected_gpu_index is not None and gpu.index != selected_gpu_index:
-                continue
 
             gpu_index = gpu.index
             allocatable_vram = allocatable.vram.get(gpu_index, 0)
@@ -483,7 +393,6 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             if gpu.memory is None or gpu.memory.total == 0:
                 continue
 
-            overcommit = False
             exceeds_vram = (
                 self._vram_claim > gpu.memory.total * self._gpu_memory_utilization
                 if self._gpu_memory_utilization > 0  # LLMs
@@ -494,27 +403,24 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
                 and allocatable_gpu_memory_utilization < self._gpu_memory_utilization
             )
             if exceeds_vram or exceeds_memory_utilization:
-                if selected_gpu_index is not None:
-                    overcommit = True
-                else:
-                    continue
+                continue
 
-            vram_claim = (
+            vram_claim_bytes = (
                 int(gpu.memory.total * self._gpu_memory_utilization)
                 if self._gpu_memory_utilization > 0  # LLMs
                 else int(self._vram_claim)  # non LLMs
             )
 
+            vram_claim = {gpu_index: vram_claim_bytes}
             candidates.append(
                 ModelInstanceScheduleCandidate(
                     worker=worker,
                     gpu_indexes=[gpu_index],
+                    gpu_type=gpu.type,
                     computed_resource_claim=ComputedResourceClaim(
-                        vram={
-                            gpu_index: vram_claim,
-                        },
+                        vram=vram_claim,
+                        ram=get_computed_ram_claim(self._model, vram_claim),
                     ),
-                    overcommit=overcommit,
                 )
             )
 
@@ -533,24 +439,24 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
 
         return candidates
 
-    async def find_single_worker_multi_gpu_full_offloading_candidates(
+    def find_single_worker_multi_gpu_full_offloading_candidates(
         self, workers: List[Worker]
     ) -> List[ModelInstanceScheduleCandidate]:
-        if self._gpu_count == 1 or self._selected_gpu_worker_count > 1:
+        if self._gpu_count == 1:
             return []
 
         candidates = []
-        for worker in workers:
-            if not worker.status.gpu_devices:
-                continue
+        workers_of_type = group_workers_by_gpu_type(workers)
+        for gpu_type, workers_of_type in workers_of_type.items():
+            for worker in workers_of_type:
+                if not worker.status.gpu_devices:
+                    continue
 
-            result = (
-                await self._find_single_worker_multi_gpu_full_offloading_candidates(
-                    worker
+                result = self._find_single_worker_multi_gpu_full_offloading_candidates(
+                    worker, gpu_type
                 )
-            )
-            if result:
-                candidates.extend(result)
+                if result:
+                    candidates.extend(result)
 
         if not candidates:
             return []
@@ -563,8 +469,8 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         ]
         return final_candidates
 
-    async def _find_single_worker_multi_gpu_full_offloading_candidates(  # noqa: C901
-        self, worker: Worker
+    def _find_single_worker_multi_gpu_full_offloading_candidates(  # noqa: C901
+        self, worker: Worker, gpu_type: Optional[str] = None
     ) -> List[ModelInstanceScheduleCandidate]:
         """
         Find single worker multi gpu full offloading candidates for the model instance.
@@ -575,10 +481,10 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         if total_gpu < 2:
             return None
 
-        if self._selected_gpu_workers:
-            return await self.manually_select_single_worker_multi_gpu_candidates(worker)
+        allocatable = self.get_worker_allocatable_resource(worker, gpu_type)
 
-        allocatable = await self._get_worker_allocatable_resource(worker)
+        if ram_not_enough(self._ram_claim, allocatable):
+            return []
 
         gpu_list = []
         total_allocatable_vram = 0
@@ -601,7 +507,7 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             self._largest_multi_gpu_total = len(worker.status.gpu_devices)
 
         # Sort by vram in descending order
-        sorted_gpu_devices: GPUDevicesInfo = sorted(
+        sorted_gpu_devices: GPUDevicesStatus = sorted(
             gpu_list,
             key=lambda gpu: allocatable.vram.get(gpu.index, 0),
             reverse=True,
@@ -622,14 +528,16 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             gpu_sum += 1
             vram_sum += vram_claim[gpu.index]
 
-            if self._num_attention_heads and self._num_attention_heads % gpu_sum != 0:
+            if not self._is_tp_size_divisible(gpu_sum):
                 continue
 
             if self._gpu_count and gpu_sum >= self._gpu_count:
-                found_candidate = True
+                if vram_sum >= self._vram_claim:
+                    found_candidate = True
+                # if self._gpu_count is set, cannot return more than gpu_count
                 break
 
-            if self._gpu_count is None and vram_sum >= self._vram_claim:
+            if (not self._gpu_count) and vram_sum >= self._vram_claim:
                 found_candidate = True
                 break
 
@@ -637,144 +545,60 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             return [
                 ModelInstanceScheduleCandidate(
                     worker=worker,
+                    gpu_type=gpu_type,
                     gpu_indexes=gpu_indexes,
                     computed_resource_claim=ComputedResourceClaim(
                         vram=vram_claim,
+                        ram=get_computed_ram_claim(self._model, vram_claim),
                     ),
                 )
             ]
-
+        event_msg_list = []
+        if msg := self._check_tp_size_divisibility(
+            self._largest_multi_gpu_utilization_satisfied_count
+        ):
+            event_msg_list.append(msg)
         event_msg = f"The largest available worker has {byte_to_gib(self._largest_multi_gpu_vram)} GiB allocatable VRAM."
         if self._gpu_memory_utilization != 0:
             event_msg = (
                 event_msg.rstrip(".")
                 + f", {self._largest_multi_gpu_utilization_satisfied_count}/{self._largest_multi_gpu_total} of GPUs meet the VRAM utilization ratio, providing {self._cal_effective_vram():.2f} GiB of allocatable VRAM."
             )
+        event_msg_list.append(event_msg)
 
         self._event_collector.add(
             EventLevelEnum.INFO,
             EVENT_ACTION_AUTO_SINGLE_WORKER_MULTI_GPU,
-            str(ListMessageBuilder(event_msg)),
+            str(ListMessageBuilder(event_msg_list)),
         )
 
         return []
 
-    async def manually_select_single_worker_multi_gpu_candidates(  # noqa: C901
-        self, worker: Worker
-    ) -> List[ModelInstanceScheduleCandidate]:
-        if len(self._selected_gpu_workers) != 1:
-            return []
-
-        allocatable = await self._get_worker_allocatable_resource(worker)
-
-        selected_gpu_worker = self._selected_gpu_workers[0]
-        selected_gpu_indexes = self._selected_gpu_indexes_by_worker[selected_gpu_worker]
-        if worker.name != selected_gpu_worker:
-            return []
-
-        overcommit = False
-        total_allocatable_vram = 0
-        satisfied_gpu_count = 0
-        vram_claims = {}
-        for gpu in worker.status.gpu_devices:
-            if gpu.index not in selected_gpu_indexes:
-                continue
-            if gpu.memory is None or gpu.memory.total is None:
-                continue
-            vram_claim = (
-                int(gpu.memory.total * self._gpu_memory_utilization)
-                if self._gpu_memory_utilization > 0  # LLMs
-                else int(self._vram_claim / len(selected_gpu_indexes))  # non LLMs
-            )
-            vram_claims[gpu.index] = vram_claim
-
-            # Check if the GPU is overcommitted
-            allocatable_vram = allocatable.vram.get(gpu.index, 0)
-            allocatable_gpu_memory_utilization = allocatable_vram / gpu.memory.total
-            if (
-                self._gpu_memory_utilization > 0
-                and allocatable_gpu_memory_utilization < self._gpu_memory_utilization
-            ):
-                overcommit = True
-                if worker.name not in self._unsatisfied_gpu_messages:
-                    self._unsatisfied_gpu_messages[worker.name] = []
-                self._unsatisfied_gpu_messages[worker.name].append(gpu.index)
-
-            # Record allocation info for scheduling message
-            total_allocatable_vram += allocatable_vram
-            if allocatable_vram / gpu.memory.total > self._gpu_memory_utilization:
-                satisfied_gpu_count += 1
-
-        self._largest_multi_gpu_vram = total_allocatable_vram
-        self._largest_multi_gpu_utilization_satisfied_count = satisfied_gpu_count
-        self._largest_multi_gpu_total = len(selected_gpu_indexes)
-
-        if sum(vram_claims.values()) < self._vram_claim:
-            overcommit = True
-            # Construct event collector.
-            scheduling_msg = ListMessageBuilder([])
-            if self._gpu_memory_utilization != 0:
-                scheduling_msg.append(
-                    f"Selected GPUs have {byte_to_gib(self._largest_multi_gpu_vram)} GiB of VRAM."
-                )
-            else:
-                unsatisfied_devices_msg = str(
-                    self._unsatisfied_gpu_messages[worker.name]
-                )
-                if len(self._unsatisfied_gpu_messages[worker.name]) > 3:
-                    unsatisfied_devices_msg = (
-                        str(self._unsatisfied_gpu_messages[worker.name][:3]).rstrip("]")
-                        + f"...(more {len(self._unsatisfied_gpu_messages[worker.name]) - 3})]"
-                    )
-                scheduling_msg.extend(
-                    [
-                        f"Worker {worker.name} GPU indexes {unsatisfied_devices_msg} fail to meet the {(self._gpu_memory_utilization * 100):.2f}% allocatable VRAM ratio.",
-                        f"Selected GPUs have {byte_to_gib(self._largest_multi_gpu_vram)} GiB allocatable VRAM, {self._largest_multi_gpu_utilization_satisfied_count}/{self._largest_multi_gpu_total} of GPUs meet the VRAM utilization ratio, providing {self._cal_effective_vram():.2f} GiB of allocatable VRAM.",
-                    ]
-                )
-            self._event_collector.add(
-                EventLevelEnum.INFO, EVENT_ACTION_MANUAL_MULTI, str(scheduling_msg)
-            )
-
-        return [
-            ModelInstanceScheduleCandidate(
-                worker=worker,
-                gpu_indexes=selected_gpu_indexes,
-                computed_resource_claim=ComputedResourceClaim(
-                    vram=vram_claims,
-                ),
-                overcommit=overcommit,
-            )
-        ]
-
-    async def find_multi_worker_multi_gpu_candidates(
+    def find_multi_worker_multi_gpu_candidates(
         self, workers: List[Worker]
     ) -> List[ModelInstanceScheduleCandidate]:
-        if not self._cfg.enable_ray:
-            return []
+        candidates = []
+        workers_of_type = group_workers_by_gpu_type(workers)
+        for gpu_type, workers_of_type in workers_of_type.items():
+            result = self.auto_select_multi_worker_multi_gpu_candidates(
+                workers_of_type, gpu_type
+            )
+            if result:
+                candidates.extend(result)
 
-        if self._model.backend_version:
-            # Using custom backend version to run vLLM across multiple workers is not supported.
-            return []
+        return candidates
 
-        if self._selected_gpu_workers:
-            return await self.manual_select_multi_worker_multi_gpu_candidates(workers)
-
-        if self._model.distributed_inference_across_workers:
-            return await self.auto_select_multi_worker_multi_gpu_candidates(workers)
-
-        return []
-
-    async def auto_select_multi_worker_multi_gpu_candidates(  # noqa: C901
-        self, workers: List[Worker]
+    def auto_select_multi_worker_multi_gpu_candidates(  # noqa: C901
+        self, workers: List[Worker], gpu_type: Optional[str] = None
     ) -> List[ModelInstanceScheduleCandidate]:
         """
         Auto select multi worker multi gpu candidates.
         Currently, a candidate should match the following conditions:
         1. Workers in the candidate have the same number of GPUs.
         2. All GPUs in the worker satisfy the gpu_memory_utilization requirement.
-        3. The total number of GPUs can be divided by the number of attention heads.
+        3. TP size can be divided by the number of attention heads.
         4. The total VRAM claim is greater than the estimated VRAM claim.
+        5. If gpu_count is set via parallelism, the total GPU count should be equal to gpu_count.
         """
 
         if not workers or len(workers) < 2:
@@ -800,11 +624,20 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             if len(worker_group) < 2:
                 continue
 
+            if not self._is_tp_size_divisible(gpu_count):
+                continue
+
             selected_workers: List[Worker] = []
             gpu_sum = 0
             vram_sum = 0
             for worker in worker_group:
-                allocatable = await self._get_worker_allocatable_resource(worker)
+                allocatable = self.get_worker_allocatable_resource(worker, gpu_type)
+
+                if ram_not_enough(self._ram_claim, allocatable):
+                    # The RAM resource(for extended KV cache) is required per worker.
+                    # Skip the worker if it does not satisfy the RAM requirement.
+                    continue
+
                 if any(
                     gpu.memory is None
                     or gpu.memory.total is None
@@ -823,13 +656,19 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
                     for gpu in worker.status.gpu_devices
                 )
 
-                if (
-                    self._num_attention_heads
-                    and self._num_attention_heads % gpu_sum == 0
-                ) and (vram_sum >= self._vram_claim):
+                if self._gpu_count:
+                    # Parallelism is set. Proceed until we match the exact GPU count.
+                    if gpu_sum < self._gpu_count:
+                        continue
+                    elif gpu_sum > self._gpu_count:
+                        break
+
+                if vram_sum >= self._vram_claim:
                     return [
                         _create_candidate(
-                            selected_workers, self._gpu_memory_utilization
+                            self._model,
+                            selected_workers,
+                            self._gpu_memory_utilization,
                         )
                     ]
             if vram_sum > largest_vram:
@@ -869,203 +708,59 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
 
         return []
 
-    async def manual_select_multi_worker_multi_gpu_candidates(  # noqa: C901
-        self, workers: List[Worker]
-    ) -> List[ModelInstanceScheduleCandidate]:
-        """
-        Get manual selected multi worker multi gpu candidates.
-        """
-        if not self._selected_gpu_workers or len(self._selected_gpu_workers) < 2:
-            return []
-
-        if not workers:
-            return []
-
-        sort_workers_by_gpu_count(workers)
-
-        main_worker = workers[0]
-        main_worker_name = main_worker.name
-        main_gpu_indexes = self._selected_gpu_indexes_by_worker[main_worker_name]
-        main_vram_claim = await self._get_worker_vram_claim(
-            main_worker, main_gpu_indexes, self._gpu_memory_utilization
+    def _validate_arguments(self):
+        tp = find_int_parameter(
+            self._model.backend_parameters, ["tensor-parallel-size", "tp"]
         )
-
-        subordinate_workers: List[ModelInstanceSubordinateWorker] = []
-        for worker in workers:
-            if worker.name not in self._selected_gpu_workers:
-                continue
-
-            if not await self._validate_distributed_vllm_limit_per_worker(worker):
-                return []
-
-            if worker.name == main_worker_name:
-                continue
-
-            gpu_indexes = self._selected_gpu_indexes_by_worker[worker.name]
-            vram_claim = await self._get_worker_vram_claim(
-                worker, gpu_indexes, self._gpu_memory_utilization
+        if msg := self._check_tp_size_divisibility(tp):
+            raise ValueError(
+                msg + " Consider adjusting your tensor-parallel-size value."
             )
-
-            subordinate_workers.append(
-                ModelInstanceSubordinateWorker(
-                    worker_id=worker.id,
-                    worker_name=worker.name,
-                    worker_ip=worker.ip,
-                    total_gpus=len(worker.status.gpu_devices),
-                    gpu_indexes=gpu_indexes,
-                    computed_resource_claim=ComputedResourceClaim(
-                        vram=vram_claim,
-                    ),
-                )
-            )
-
-        overcommit = (
-            self._largest_multi_gpu_utilization_satisfied_count
-            < self._largest_multi_gpu_total
-            or self._largest_multi_gpu_vram * self._gpu_memory_utilization
-            < self._vram_claim
-        )
-
-        if overcommit:
-            scheduling_msg = ListMessageBuilder([])
-            if self._gpu_memory_utilization == 0:
-                scheduling_msg.append(
-                    f"Selected GPUs have {byte_to_gib(self._largest_multi_gpu_vram)} GiB of VRAM."
-                )
-            else:
-                for worker_name, gpu_indexes in self._unsatisfied_gpu_messages.items():
-                    # Some seleted gpu is not meet the utilization
-                    devices_msg = (
-                        str(gpu_indexes[:3]).rstrip("]")
-                        + f"...(more {len(gpu_indexes) - 3})]"
-                        if len(gpu_indexes) > 3
-                        else str(gpu_indexes)
-                    )
-                    unsatisfied_msg = f"Worker {worker_name} GPU indexes {devices_msg}"
-                    if len(self._unsatisfied_gpu_messages) > 1:
-                        unsatisfied_msg += f" and other {len(self._unsatisfied_gpu_messages) - 1} {'workers' if len(self._unsatisfied_gpu_messages) > 2 else 'worker'}"
-                    unsatisfied_msg += f" {'fail' if len(self._unsatisfied_gpu_messages) > 1 else 'fails'} to meet the {(self._gpu_memory_utilization * 100):.2f}% allocatable VRAM ratio."
-                    scheduling_msg.append(unsatisfied_msg)
-                    break
-
-                # All selected gpus combined VRAM is not enough.
-                scheduling_msg.append(
-                    f"Selected GPUs have {byte_to_gib(self._largest_multi_gpu_vram)} GiB allocatable VRAM, "
-                    f"{self._largest_multi_gpu_utilization_satisfied_count}/{self._largest_multi_gpu_total} of GPUs meet the VRAM utilization ratio, providing {self._cal_effective_vram():.2f} GiB of allocatable VRAM."
-                )
-
-            self._event_collector.add(
-                EventLevelEnum.INFO, EVENT_ACTION_MANUAL_MULTI, str(scheduling_msg)
-            )
-
-        return [
-            ModelInstanceScheduleCandidate(
-                worker=main_worker,
-                gpu_indexes=main_gpu_indexes,
-                computed_resource_claim=ComputedResourceClaim(
-                    vram=main_vram_claim,
-                ),
-                subordinate_workers=subordinate_workers,
-                overcommit=overcommit,
-            )
-        ]
-
-    async def _validate_distributed_vllm_limit_per_worker(self, worker: Worker) -> bool:
-        """
-        Validate that there is no more than one distributed vLLM instance per worker.
-        """
-        instances = await get_worker_model_instances(self._engine, worker)
-        for instance in instances:
-            if (
-                instance.distributed_servers
-                and instance.distributed_servers.subordinate_workers
-            ):
-                self._messages = [
-                    f"Each worker can run only one distributed vLLM instance. Worker '{worker.name}' already has '{instance.name}'."
-                ]
-                return False
-
-        return True
-
-    async def _get_worker_vram_claim(
-        self,
-        worker: Worker,
-        gpu_indexes: List[int],
-        gpu_memory_utilization: float = 0.9,
-    ) -> Dict[int, int]:
-        """
-        Given a worker and gpu indexes, get the vram claim according to gpu_memory_utilization.
-        Returns a dictionary of gpu index to vram claim in bytes, and a boolean indicating
-        whether the claim exceeds the allocatable vram.
-        """
-        vram_claim: Dict[int, int] = {}
-
-        allocatable = await self._get_worker_allocatable_resource(worker)
-        for gpu in worker.status.gpu_devices:
-            if gpu.index in gpu_indexes:
-                gpu_vram_claim = int(gpu.memory.total * gpu_memory_utilization)
-                vram_claim[gpu.index] = gpu_vram_claim
-
-                # Record allocation info for scheduling message
-                allocatable_vram = allocatable.vram.get(gpu.index, 0)
-                self._largest_multi_gpu_vram += allocatable_vram
-                if gpu_vram_claim < allocatable_vram:
-                    self._largest_multi_gpu_utilization_satisfied_count += 1
-                else:
-                    if worker.name not in self._unsatisfied_gpu_messages:
-                        self._unsatisfied_gpu_messages[worker.name] = []
-                    self._unsatisfied_gpu_messages[worker.name].append(gpu.index)
-
-        self._largest_multi_gpu_total += len(gpu_indexes)
-
-        return vram_claim
 
 
 def _create_candidate(
-    selected_workers: List[Worker], gpu_memory_utilization: float = 0.9
+    model: Model,
+    selected_workers: List[Worker],
+    gpu_memory_utilization: float = 0.9,
 ) -> ModelInstanceScheduleCandidate:
     """
     Create a candidate with all GPUs from the selected workers.
     """
     main_worker = selected_workers[0]
+    vram_claim_main = {
+        gpu.index: int(gpu.memory.total * gpu_memory_utilization)
+        for gpu in main_worker.status.gpu_devices
+    }
+    gpu_type = main_worker.status.gpu_devices[0].type
     candidate = ModelInstanceScheduleCandidate(
         worker=main_worker,
+        gpu_type=gpu_type,
         gpu_indexes=[gpu.index for gpu in main_worker.status.gpu_devices],
         computed_resource_claim=ComputedResourceClaim(
-            vram={
-                gpu.index: int(gpu.memory.total * gpu_memory_utilization)
-                for gpu in main_worker.status.gpu_devices
-            },
+            vram=vram_claim_main,
+            ram=get_computed_ram_claim(model, vram_claim_main),
         ),
     )
-    candidate.subordinate_workers = [
-        ModelInstanceSubordinateWorker(
-            worker_id=worker.id,
-            worker_name=worker.name,
-            worker_ip=worker.ip,
-            total_gpus=len(worker.status.gpu_devices),
-            gpu_indexes=[gpu.index for gpu in worker.status.gpu_devices],
-            computed_resource_claim=ComputedResourceClaim(
-                vram={
-                    gpu.index: int(gpu.memory.total * gpu_memory_utilization)
-                    for gpu in worker.status.gpu_devices
-                },
-            ),
+    candidate.subordinate_workers = []
+    for worker in selected_workers[1:]:
+        vram_claim_subworker = {
+            gpu.index: int(gpu.memory.total * gpu_memory_utilization)
+            for gpu in worker.status.gpu_devices
+        }
+        candidate.subordinate_workers.append(
+            ModelInstanceSubordinateWorker(
+                worker_id=worker.id,
+                worker_name=worker.name,
+                worker_ip=worker.ip,
+                worker_ifname=worker.ifname,
+                total_gpus=len(worker.status.gpu_devices),
+                gpu_type=gpu_type,
+                gpu_indexes=[gpu.index for gpu in worker.status.gpu_devices],
+                computed_resource_claim=ComputedResourceClaim(
+                    vram=vram_claim_subworker,
+                    ram=get_computed_ram_claim(model, vram_claim_subworker),
+                ),
+            )
         )
-        for worker in selected_workers[1:]
-    ]
+
     return candidate
-
-
-def sort_workers_by_gpu_count(workers: List[Worker]):
-    """
-    Sort workers by the number of GPUs.
-    """
-    workers.sort(
-        key=lambda worker: (
-            len(worker.status.gpu_devices)
-            if worker.status and worker.status.gpu_devices
-            else 0
-        ),
-        reverse=True,
-    )
