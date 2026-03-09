@@ -87,6 +87,7 @@ openai_model_prefixes: List[RoutePrefix] = [
         [
             "/chat/completions",
             "/completions",
+            "/responses",
             "/embeddings",
             "/audio/transcriptions",
             "/audio/speech",
@@ -254,23 +255,23 @@ def provider_registry_name(id: int) -> str:
 
 
 def provider_registry(provider: ModelProvider) -> Optional[McpBridgeRegistry]:
-    domain = provider.config.get_service_registry()
-    if domain is None:
-        return None
     provider_url = provider.config.get_base_url()
+    if provider_url is None:
+        return None
     result = urlparse(url=provider_url)
-    protocol = "https"
-    port = 443
-    if result.scheme == "http":
-        protocol = "http"
-        port = 80
-    registry_type = "dns"
-    parsed_domain = urlparse(f"//{domain}")
-    if is_ipaddress(parsed_domain.hostname):
-        registry_type = "static"
-        port = 80
-    elif result.port is not None:
-        port = result.port
+    protocol = "http" if result.scheme == "http" else "https"
+    port = 443 if protocol == "https" else 80
+    registry_type = (
+        "static" if result.hostname and is_ipaddress(result.hostname) else "dns"
+    )
+    if registry_type == "static":
+        domain = result.netloc
+        if result.port is None:
+            domain = f"{domain}:{port}"
+    else:
+        domain = result.hostname
+        if result.port is not None:
+            port = result.port
     registry_name = provider_registry_name(provider.id)
     proxyName = f"{registry_name}-proxy" if provider.proxy_url else None
     return McpBridgeRegistry(
@@ -491,10 +492,13 @@ def generate_model_ingress(
     included_proxy_route: Optional[bool] = False,
     extra_annotations: Optional[Dict[str, str]] = None,
 ) -> k8s_client.V1Ingress:
+    retry_policies = "error,timeout,http_503,http_502,non_idempotent"
     annotations = {
         "higress.io/rewrite-target": "/$1$3",
         "higress.io/destination": destinations,
         "higress.io/ignore-path-case": 'true',
+        "higress.io/proxy-next-upstream-tries": '2',
+        "higress.io/proxy-next-upstream": retry_policies,
         **higress_http_header_matcher("exact", "x-higress-llm-model", route_name),
     }
     if extra_annotations is not None:

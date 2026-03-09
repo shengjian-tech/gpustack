@@ -7,6 +7,7 @@ import yaml
 from fastapi import APIRouter, Body
 from gpustack_runner.runner import ServiceVersionedRunner, ServiceRunner
 from gpustack_runtime.deployer.__utils__ import compare_versions
+from pydantic import ValidationError
 from starlette.responses import StreamingResponse
 
 from gpustack.api.exceptions import (
@@ -31,6 +32,7 @@ from gpustack.schemas.inference_backend import (
     is_built_in_backend,
 )
 from gpustack.schemas.models import BackendEnum, Model, BackendSourceEnum
+from gpustack.server.db import async_session
 from gpustack.server.deps import ListParamsDep, SessionDep
 from gpustack_runner import list_service_runners
 from gpustack_runtime.detector.ascend import get_ascend_cann_variant
@@ -613,12 +615,14 @@ async def get_inference_backends(  # noqa: C901
             media_type="text/event-stream",
         )
 
-    merged_backends = await merge_runner_versions_to_db(
-        session, with_deprecated=include_deprecated
-    )
+    async with async_session() as session:
+        merged_backends = await merge_runner_versions_to_db(
+            session, with_deprecated=include_deprecated
+        )
 
-    # Get worker GPU information for framework sorting
-    workers = await Worker.all(session)
+        # Get worker GPU information for framework sorting
+        workers = await Worker.all(session)
+
     framework_list = set()
     for worker in workers:
         if worker.status and worker.status.gpu_devices:
@@ -729,7 +733,7 @@ async def get_all_inference_backends(
     backends = await merge_runner_versions_to_db(session)
     ret = []
     for backend in backends:
-        if not backend.is_built_in:
+        if backend.backend_source == BackendSourceEnum.CUSTOM:
             ret.append(backend)
             continue
         for built_in_version, config in backend.built_in_version_configs.items():
@@ -1003,6 +1007,12 @@ async def create_inference_backend_from_yaml(
         # Validate version names for custom backends
         validate_custom_suffix(yaml_data['backend_name'], None)
 
+        # Validate YAML data using Pydantic model to ensure field types are correct
+        try:
+            InferenceBackendCreate.model_validate(yaml_data)
+        except ValidationError as e:
+            raise BadRequestException(message=f"Invalid YAML data: {e}")
+
         # Create the backend
         backend = InferenceBackend(**yaml_data)
         backend = await InferenceBackend.create(session, backend)
@@ -1060,6 +1070,7 @@ async def update_inference_backend_from_yaml(  # noqa: C901
             "version_configs",
             "default_backend_param",
             "default_run_command",
+            "default_entrypoint",
             "health_check_path",
             "description",
             "default_env",
@@ -1097,6 +1108,12 @@ async def update_inference_backend_from_yaml(  # noqa: C901
             yaml_data['version_configs'] = _merge_community_versions(
                 backend, yaml_data.get('version_configs')
             )
+
+        # Validate YAML data using Pydantic model to ensure field types are correct
+        try:
+            InferenceBackendUpdate.model_validate(yaml_data)
+        except ValidationError as e:
+            raise BadRequestException(message=f"Invalid YAML data: {e}")
 
         # Update the backend from YAML data (after normalization)
         await backend.update(session, yaml_data)

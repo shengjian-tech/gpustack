@@ -90,6 +90,9 @@ class AscendMindIEResourceFitSelector(ScheduleCandidatesSelector):
         )
         self._set_gpu_count(world_size, strategies)
 
+    def _should_check_vision_tp_divisibility(self) -> bool:
+        return False
+
     @staticmethod
     def get_world_size_from_backend_parameters(
         model: Model,
@@ -535,6 +538,7 @@ class AscendMindIEResourceFitSelector(ScheduleCandidatesSelector):
                     continue
 
                 # Append the device to the candidate.
+                candidate.gpu_type = device.type
                 candidate.gpu_indexes.append(device.index)
                 candidate.gpu_addresses.append(
                     device.network.inet

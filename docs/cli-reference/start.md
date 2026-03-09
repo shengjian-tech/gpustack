@@ -11,6 +11,25 @@ Run GPUStack server or worker.
 gpustack start [OPTIONS]
 ```
 
+!!! note "CLI Argument Placement"
+
+    In Docker, the actual command executed by `docker run` consists of **ENTRYPOINT** and **COMMAND**.
+
+    The `gpustack/gpustack` image sets its `ENTRYPOINT`, which can be simply understood as
+    (or considered equivalent to):
+
+        gpustack start
+
+    Therefore, CLI arguments for `gpustack start` must be placed after the image name,
+    at the end of the `docker run` command, rather than as options to `docker run` itself.
+
+    Example:
+
+        docker run [docker options] gpustack/gpustack <start-args>
+
+    In Kubernetes, these arguments should be specified using the `args` field
+    in the container specification.
+
 ## Configurations
 
 ### Common Options
@@ -47,7 +66,7 @@ gpustack start [OPTIONS]
 | `--disable-worker`                               | (empty)                                | (DEPRECATED) Disable the embedded worker for the GPUStack server. New installations will not have the embedded worker by default. Use '--enable-worker' to enable the embedded worker if needed. If neither flag is set, for backward compatibility, the embedded worker will be enabled by default for legacy installations prior to v2.0.1. |
 | `--enable-worker`                                | `False`                                | Enable the embedded worker for the GPUStack server.                                                                                                                                                                                                                                                                                           |
 | `--bootstrap-password` value                     | Auto-generated.                        | Initial password for the default admin user.                                                                                                                                                                                                                                                                                                  |
-| `--database-url` value                           | Embedded PostgreSQL.                   | URL of the database. Supports PostgreSQL 13.0+, and MySQL 8.0+. Example: postgresql://user:password@host:port/db_name or mysql://user:password@host:port/db_name                                                                                                                                                                              |
+| `--database-url` value                           | Embedded PostgreSQL.                   | URL of the database. Supports PostgreSQL 13.0+, and MySQL 8.0.36+. Example: postgresql://user:password@host:port/db_name or mysql://user:password@host:port/db_name                                                                                                                                                                           |
 | `--ssl-keyfile` value                            | (empty)                                | Path to the SSL key file.                                                                                                                                                                                                                                                                                                                     |
 | `--ssl-certfile` value                           | (empty)                                | Path to the SSL certificate file.                                                                                                                                                                                                                                                                                                             |
 | `--force-auth-localhost`                         | `False`                                | Force authentication for requests originating from localhost (127.0.0.1). When set to True, all requests from localhost will require authentication.                                                                                                                                                                                          |
