@@ -1,3 +1,4 @@
+import re
 import logging
 import copy
 import math
@@ -62,11 +63,14 @@ DestinationTupleList = List[Tuple[int, str, McpBridgeRegistry]]
 class RoutePrefix:
     prefixes: List[str]
     support_legacy: bool = True
+    additional_versions: Optional[List[str]] = None
 
     def flattened_prefixes(self) -> List[str]:
         versioned_prefixes = ["/v1"]
         if self.support_legacy:
             versioned_prefixes.append("/v1-openai")
+        if self.additional_versions:
+            versioned_prefixes.extend(self.additional_versions)
         flattened = []
         for versioned_prefix in versioned_prefixes:
             for prefix in self.prefixes:
@@ -78,8 +82,17 @@ class RoutePrefix:
         Returns regex patterns for the prefixes, considering versioning and legacy support.
         It supports removing -openai suffix from the versioned prefix with rewrite-target: /$1$3
         """
-        versioned_prefix = f"/(v1){'(-openai)?' if self.support_legacy else '()'}"
-        return [f"{versioned_prefix}({prefix})" for prefix in self.prefixes]
+        versioned_prefixes = [f"/(v1){'(-openai)?' if self.support_legacy else '()'}"]
+        if self.additional_versions:
+            versioned_prefixes.extend(
+                f"/({re.escape(additional_version.lstrip('/'))})()"
+                for additional_version in self.additional_versions
+            )
+        return [
+            f"{versioned_prefix}({prefix})"
+            for versioned_prefix in versioned_prefixes
+            for prefix in self.prefixes
+        ]
 
 
 openai_model_prefixes: List[RoutePrefix] = [
@@ -96,7 +109,11 @@ openai_model_prefixes: List[RoutePrefix] = [
             "/images/edits",
         ]
     ),
-    RoutePrefix(["/rerank"], False),
+    RoutePrefix(["/rerank"], False, ["/v2"]),
+]
+
+anthropic_model_exact: List[RoutePrefix] = [
+    RoutePrefix(["/messages", "/messages/count_tokens", "/complete"], False),
 ]
 
 
@@ -128,10 +145,11 @@ def wrap_route(
 
 
 def anthropic_routes() -> List[k8s_client.V1HTTPIngressPath]:
-    return [
-        wrap_route("/v1/messages", "Prefix"),
-        wrap_route("/v1/complete", "Exact"),
-    ]
+    routes = []
+    for route_exact in anthropic_model_exact:
+        for prefix in route_exact.regex_prefixes():
+            routes.append(wrap_route(path=prefix, path_type="ImplementationSpecific"))
+    return routes
 
 
 def ingress_rule_for_model() -> k8s_client.V1IngressRule:

@@ -41,12 +41,13 @@ class S6Services:
                 self.service_port_getters[service.name] = list(service.ports)
 
     def all_services(self) -> List[str]:
+        managed_services = set(self.services) | set(self.dependencies)
         if self.support_pipeline:
             pipeline_services = [
                 self.pipeline_prefix + service for service in self.services
             ]
-            return list(self.services) + pipeline_services
-        return list(self.services)
+            return list(managed_services) + pipeline_services
+        return list(managed_services)
 
     def set_ports(self, config: object, ports: Dict[int, str]):
         if not self.service_port_getters:
@@ -82,19 +83,10 @@ migration_services = S6Services(
     S6Service("gpustack-migration", [], True, False),
 )
 observability_services = S6Services(
-    S6Service("grafana", [3000]),
-    S6Service("prometheus", [9090]),
+    S6Service("grafana", ["builtin_grafana_port"]),
+    S6Service("prometheus", ["builtin_prometheus_port"]),
     support_pipeline=True,
 )
-
-
-def all_dependent_services() -> List[str]:
-    return [
-        *gateway_services.dep_services,
-        *postgres_services.dep_services,
-        *migration_services.dep_services,
-        *observability_services.dep_services,
-    ]
 
 
 def all_services() -> List[str]:

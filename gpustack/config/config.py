@@ -4,6 +4,7 @@ from enum import Enum
 from typing import List, Optional, Dict
 from urllib.parse import urlparse
 import ipaddress
+import httpx
 
 from gpustack_runtime.detector import (
     manufacturer_to_backend,
@@ -12,7 +13,6 @@ from gpustack_runtime.detector import (
 )
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import requests
 from gpustack.utils import validators
 from gpustack.schemas.workers import (
     CPUInfo,
@@ -41,7 +41,11 @@ from gpustack.config.registration import (
     read_worker_token,
     determine_default_registry,
 )
-from gpustack.utils.network import get_first_non_loopback_ip
+from gpustack.utils.network import (
+    get_first_non_loopback_ip,
+    get_system_trust_store_ssl_context,
+    use_proxy_env_for_url,
+)
 from gpustack.utils import platform
 
 _config = None
@@ -105,7 +109,6 @@ class Config(WorkerConfig, BaseSettings):
         system_reserved: Reserved system resources.
         tools_download_base_url: Base URL to download dependency tools.
         enable_hf_transfer: Speed up file transfers with the huggingface Hub.
-        enable_hf_xet: Using Hugging Face XET for download model files.
         enable_cors: Enable CORS in server.
         allow_origins: A list of origins that should be permitted to make cross-origin requests.
         allow_credentials: Indicate that cookies should be supported for cross-origin requests.
@@ -155,7 +158,7 @@ class Config(WorkerConfig, BaseSettings):
     allow_origins: Optional[List[str]] = ['*']
     allow_credentials: bool = False
     allow_methods: Optional[List[str]] = ['GET', 'POST']
-    allow_headers: Optional[List[str]] = ['Authorization', 'Content-Type']
+    allow_headers: Optional[List[str]] = ['Authorization', 'Content-Type', 'X-API-Key']
     external_auth_type: Optional[str] = None  # external auth type
     external_auth_name: Optional[str] = None  # external auth name
     external_auth_full_name: Optional[str] = None  # external auth full name
@@ -187,6 +190,8 @@ class Config(WorkerConfig, BaseSettings):
     # Number of concurrent connections for the embedded gateway.
     gateway_concurrency: int = 16
     disable_builtin_observability: bool = False
+    builtin_prometheus_port: int = 19090
+    builtin_grafana_port: int = 13000
     grafana_url: Optional[str] = None
     grafana_worker_dashboard_uid: Optional[str] = "gpustack-worker"
     grafana_model_dashboard_uid: Optional[str] = "gpustack-model"
@@ -303,7 +308,12 @@ class Config(WorkerConfig, BaseSettings):
             return self.grafana_url
         if self.disable_builtin_observability:
             return None
-        return "http://127.0.0.1:3000"
+        return f"http://127.0.0.1:{self.builtin_grafana_port}"
+
+    def get_builtin_prometheus_url(self) -> Optional[str]:
+        if self.disable_builtin_observability or self.grafana_url is not None:
+            return None
+        return f"http://127.0.0.1:{self.builtin_prometheus_port}"
 
     @staticmethod
     def check_port_range(port_range: str, diff: Optional[int] = None):
@@ -501,6 +511,7 @@ class Config(WorkerConfig, BaseSettings):
             vendor = gd.get("vendor")
             memory = gd.get("memory")
             network = gd.get("network")
+            runtime_version = gd.get("runtime_version")
             type_ = gd.get("type") or manufacturer_to_backend(vendor)
 
             if not name:
@@ -553,6 +564,7 @@ class Config(WorkerConfig, BaseSettings):
                     device_chip_index=device_chip_index,
                     name=name,
                     vendor=vendor,
+                    runtime_version=runtime_version,
                     memory=MemoryInfo(
                         total=memory.get("total"),
                         is_unified_memory=memory.get("is_unified_memory", False),
@@ -840,9 +852,12 @@ def get_openid_configuration(issuer: str) -> dict:
     """Fetch OpenID configuration from the issuer."""
     url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
     try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        use_proxy_env = use_proxy_env_for_url(url)
+        verify = get_system_trust_store_ssl_context()
+        with httpx.Client(timeout=10, verify=verify, trust_env=use_proxy_env) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.json()
     except Exception as e:
         raise Exception(
             f"Failed to get OpenID configuration: {str(e)}. Please check the issuer URL and ensure {url} is accessible."

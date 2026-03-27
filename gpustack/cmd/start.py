@@ -283,6 +283,18 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         default=get_gpustack_env_bool("DISABLE_BUILTIN_OBSERVABILITY"),
     )
     server_group.add_argument(
+        "--builtin-prometheus-port",
+        type=int,
+        help="Port for the embedded Prometheus service. Default is 19090.",
+        default=get_gpustack_env("BUILTIN_PROMETHEUS_PORT"),
+    )
+    server_group.add_argument(
+        "--builtin-grafana-port",
+        type=int,
+        help="Port for the embedded Grafana service. Default is 13000.",
+        default=get_gpustack_env("BUILTIN_GRAFANA_PORT"),
+    )
+    server_group.add_argument(
         "--grafana-url",
         type=str,
         help="Grafana base URL for dashboard redirects and proxying. Must be browser-reachable (not a container-only hostname). If set, embedded Grafana and Prometheus will be disabled. Only required for external Grafana.",
@@ -327,7 +339,7 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     server_group.add_argument(
         "--allow-headers",
         action='append',
-        help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers Content-Type. Default: ["Authorization", "Content-Type"].',
+        help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers X-API-Key --allow-headers Content-Type. Default: ["Authorization", "Content-Type", "X-API-Key"].',
     )
 
     # OIDC settings
@@ -576,7 +588,7 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     worker_group.add_argument(
         "--enable-hf-xet",
         action=OptionalBoolAction,
-        help="Enable downloading model files using Hugging Face Xet.",
+        help="[Deprecated] Enable downloading model files using Hugging Face Xet.",
     )
     worker_group.add_argument(
         "--proxy-mode",
@@ -607,7 +619,8 @@ def run(args: argparse.Namespace):
         else:
             run_server(cfg)
     except Exception as e:
-        logger.fatal(e)
+        logger.exception(e)
+        sys.exit(1)
 
 
 def run_server(cfg: Config):
@@ -621,9 +634,8 @@ def run_server(cfg: Config):
         asyncio.run(server.start())
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
-    except Exception as e:
-        logger.exception(f"Error running server: {e}")
-        # logger.error(f"Error running server: {e}")
+    except Exception:
+        raise
     finally:
         logger.info("Server has shut down.")
 
@@ -737,6 +749,8 @@ def set_server_options(args, config_data: dict):
         "server_external_url",
         "gateway_concurrency",
         "disable_builtin_observability",
+        "builtin_prometheus_port",
+        "builtin_grafana_port",
         "grafana_url",
         "grafana_worker_dashboard_uid",
         "grafana_model_dashboard_uid",
@@ -764,7 +778,6 @@ def set_worker_options(args, config_data: dict):
         "system_reserved",
         "tools_download_base_url",
         "enable_hf_transfer",
-        "enable_hf_xet",
         "proxy_mode",
     ]
 
@@ -791,10 +804,6 @@ def set_third_party_env(cfg: Config):
         # https://huggingface.co/docs/huggingface_hub/guides/download#faster-downloads
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         logger.debug("set env HF_HUB_ENABLE_HF_TRANSFER=1")
-
-    if not cfg.enable_hf_xet:
-        os.environ["HF_HUB_DISABLE_XET"] = "1"
-        logger.debug("set env HF_HUB_DISABLE_XET=1")
 
 
 # Adapted from: https://github.com/vllm-project/vllm/blob/main/vllm/utils.py#L2438

@@ -6,6 +6,8 @@ GPUStack supports Single Sign-On (SSO) authentication methods such as OIDC and S
 
 Any authentication provider that supports OIDC can be configured. The `email`, `name` and `picture` claims are used if available. The allowed redirect URI should include `<server-url>/auth/oidc/callback`.
 
+If your OIDC provider uses a certificate issued by a private or corporate CA, see [Additional Trusted CAs](../installation/installation.md#additional-trusted-cas) for how to mount CA certificates into the GPUStack container.
+
 The following CLI flags are available for OIDC configuration:
 
 | <div style="width:180px">Flag</div>                   | Description                                                                                                                                                          |
@@ -62,6 +64,7 @@ sudo docker run -d --name gpustack \
     --network=host \
     --volume /var/run/docker.sock:/var/run/docker.sock \
     --volume gpustack-data:/var/lib/gpustack \
+    --volume /path/to/custom-root-ca.crt:/usr/local/share/ca-certificates/custom-root-ca.crt:ro \
     --runtime nvidia \
     -e GPUSTACK_OIDC_ISSUER="https://<your-auth0-domain>" \
     -e GPUSTACK_OIDC_CLIENT_ID="<your-client-id>" \
@@ -69,6 +72,10 @@ sudo docker run -d --name gpustack \
     -e GPUSTACK_OIDC_REDIRECT_URI="<your-server-url>/auth/oidc/callback" \
     gpustack/gpustack
 ```
+
+!!! note
+
+    The custom CA certificate mount is only required when your OIDC provider is signed by a private CA. Public OIDC providers such as Auth0 typically do not require it.
 
 ## SAML
 

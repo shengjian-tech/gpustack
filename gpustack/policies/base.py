@@ -112,10 +112,16 @@ class WorkerFilterChain:
         for policy in self.filters:
             workers, filter_messages = await policy.filter(workers)
             messages.extend(filter_messages)
+            if not workers:
+                break
         return workers, messages
 
 
 class ModelInstanceScorer(ABC):
+    @property
+    def max_score(self) -> Optional[float]:
+        return getattr(self, "_max_score", None)
+
     @abstractmethod
     async def score_instances(
         self, instances: List[ModelInstance]

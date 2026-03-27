@@ -38,6 +38,7 @@ class AscendMindIEParameters:
     max_link_num: int = 1000
     token_timeout: int = 600
     e2e_timeout: int = 600
+    openai_support: str = "vllm"
     #
     # Backend config
     #
@@ -160,6 +161,12 @@ class AscendMindIEParameters:
             type=int,
             default=self.e2e_timeout,
             help="E2E (from request accepted to inference stopped) timeout in seconds.",
+        )
+        parser.add_argument(
+            "--openai-support",
+            type=str,
+            default=self.openai_support,
+            help="The compatibility mode for OpenAI API.",
         )
         #
         # Backend config
@@ -696,6 +703,8 @@ class AscendMindIEParameters:
             raise argparse.ArgumentTypeError(
                 "--e2e-timeout must be in the range [1, 3600]"
             )
+        if not self.openai_support:
+            raise argparse.ArgumentTypeError("--openai-support cannot be empty")
         # Backend config
         if self.kv_pool_config:
             try:
@@ -1223,6 +1232,7 @@ class AscendMindIEServer(InferenceServer):
             env["MINDIE_LOG_LEVEL"] = params.log_level.upper()
             # -- Server config
             server_config["maxLinkNum"] = params.max_link_num
+            server_config["openAiSupport"] = params.openai_support
             # -- Backend config
             if params.kv_pool_config_parsed:
                 backend_config["kvPoolConfig"] = params.kv_pool_config_parsed
@@ -1804,7 +1814,17 @@ fi
         "openAiSupport" : "vllm",
         "tokenTimeout" : 600,
         "e2eTimeout" : 600,
-        "distDPServerEnabled":false
+        "distDPServerEnabled":false,
+        "layerwiseDisaggregated" : false,
+        "layerwiseDisaggregatedRoleType" : "",
+        "layerwiseDisaggregatedMasterIpAddress" : "127.0.0.3",
+        "layerwiseDisaggregatedSlaveIpAddress" : ["127.0.0.4"],
+        "layerwiseDisaggregatedDataPort" : 10024,
+        "layerwiseDisaggregatedCrtlPort" : [10001,10002],
+        "HealthCheckConfig" :
+        {
+            "npuUsageThreshold" : 0
+        }
     },
 
     "BackendConfig" : {
@@ -1867,7 +1887,15 @@ fi
             "maxQueueDelayMicroseconds" : 5000,
             "maxFirstTokenWaitTime": 2500
         }
-    }
+    },
+
+    "LogConfig": {
+        "dynamicLogLevel" : "",
+        "dynamicLogLevelValidHours" : 2,
+        "dynamicLogLevelValidTime" : ""
+    },
+
+    "EnableDynamicAdjustTimeoutConfig": false
 }
 """
         return json.loads(config_str)
